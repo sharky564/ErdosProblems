@@ -15,7 +15,8 @@ std::vector<uint64_t> primes;
 void get_primes(uint64_t limit) 
 {
     std::vector<bool> sieve(limit + 1, true);
-    sieve[0] = sieve[1] = false;
+    sieve[0] = false;
+    sieve[1] = false;
     for (uint64_t p = 2; p * p <= limit; ++p) 
     {
         if (sieve[p]) 
@@ -37,7 +38,9 @@ bool exact_check(uint64_t n, uint64_t k)
     {
         if (p > 2 * k)
             break;
-        uint64_t nu_prod = 0, nu_comb = 0, power = p;
+        uint64_t nu_prod = 0;
+        uint64_t nu_comb = 0;
+        uint64_t power = p;
         while (true) 
         {
             uint64_t v_n = n / power;
@@ -64,7 +67,8 @@ uint64_t solve(uint64_t k)
     auto chunks = std::views::iota(0, NUM_THREADS);
 
     auto is_valid_c = [](uint64_t c, uint64_t p) {
-        uint64_t nu = 0, temp_c = c;
+        uint64_t nu = 0;
+        uint64_t temp_c = c;
         while (temp_c >= p && temp_c % p == 0) 
         {
             ++nu;
