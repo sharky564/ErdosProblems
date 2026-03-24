@@ -14,6 +14,7 @@
 #include <bit>
 #include <fstream>
 #include <filesystem>
+#include <sstream>
 
 const unsigned int NUM_THREADS = std::thread::hardware_concurrency(); // 8
 const unsigned int NUM_SEQ = 2;
@@ -406,11 +407,18 @@ int main()
         
         uint64_t candidates_checked = (ans >= start_L) ? (ans - start_L + 1) : 1;
         double speed = candidates_checked / seconds;
+    
+        std::ostringstream oss;
+        oss << "k = " << std::setw(2) << k 
+            << " | min n = " << std::setw(15) << ans 
+            << " | Time: " << std::fixed << std::setprecision(4) << std::setw(12) << seconds << " s"
+            << " | Speed: " << std::fixed << std::setprecision(2) << std::setw(8) << (speed / 1e6) << " M candidates/s\n";
         
-        std::cout << "k = " << std::setw(2) << k 
-                  << " | min n = " << std::setw(15) << ans 
-                  << " | Time: " << std::fixed << std::setprecision(4) << std::setw(12) << seconds << " s"
-                  << " | Speed: " << std::fixed << std::setprecision(2) << std::setw(8) << (speed / 1e6) << " M candidates/s\n";
+        std::string output_str = oss.str();
+        std::cout << output_str;
+        std::ofstream results_file("results.txt", std::ios::app);
+        if (results_file)
+            results_file << output_str;
 
         start_L = ans;
         std::ofstream fout("checkpoint.tmp");
