@@ -20,6 +20,7 @@ const unsigned int NUM_THREADS = std::thread::hardware_concurrency(); // 8
 const unsigned int NUM_SEQ = 2;
 std::vector<uint64_t> primes;
 std::vector<uint64_t> prime_magics;
+std::vector<uint8_t> prime_shifts;
 
 void get_primes(uint64_t limit) 
 {
@@ -30,7 +31,7 @@ void get_primes(uint64_t limit)
     {
         if (sieve[p]) 
         {
-            for (uint64_t i : std::views::iota(p * p, limit + 1) | std::views::stride(p))
+            for (uint64_t i = p * p; i <= limit; i += p)
                 sieve[i] = false;
         }
     }
@@ -39,14 +40,17 @@ void get_primes(uint64_t limit)
         if (sieve[p]) 
         {
             primes.push_back(p);
-            prime_magics.push_back((uint64_t)(((unsigned __int128)1 << 64) / p + 1));
+            uint8_t shift = std::bit_width(p) - 1;
+            unsigned __int128 magic_128 = ((unsigned __int128)1 << (64 + shift)) / p + 1;
+            prime_magics.push_back((uint64_t)magic_128);
+            prime_shifts.push_back(shift);
         }
     }
 }
 
 bool exact_check(uint64_t n, uint64_t k) 
 {
-    uint64_t nu_2_prod = std::popcount(n - k - 1) - std::popcount(n) + k + 1;
+    uint32_t nu_2_prod = std::popcount(n - k - 1) - std::popcount(n) + k + 1;
     if (std::popcount(n) < nu_2_prod) [[unlikely]]
         return false;
 
@@ -104,20 +108,14 @@ inline void process_prime_p(uint64_t start_c, uint64_t start_j, uint64_t W_block
                     while (temp > 0) 
                     {
                         uint64_t digit = temp % p;
-                        if (digit * 2 + carry >= p) 
-                        {
-                            ++carries;
-                            carry = 1;
-                            if (carries > nu)
-                                break;
-                        } 
-                        else 
-                        {
-                            carry = 0;
-                        }
+                        carry = (digit * 2 + carry >= p);
+                        carries += carry;
+                        if (carries > nu)
+                            break;
                         temp /= p;
                     }
-                    if (carries <= nu) is_val = false;
+                    if (carries <= nu)
+                        is_val = false;
                 }
                 
                 if (!is_val) [[unlikely]] 
@@ -155,7 +153,7 @@ inline void process_prime_p(uint64_t start_c, uint64_t start_j, uint64_t W_block
     }
 }
 
-inline void process_p_dyn(uint64_t p, uint64_t magic, uint64_t start_c, uint64_t start_j, uint64_t W_block, uint8_t* valid, uint64_t* rem, uint64_t k) {
+inline void process_p_dyn(uint64_t p, uint64_t magic, uint8_t shift, uint64_t start_c, uint64_t start_j, uint64_t W_block, uint8_t* valid, uint64_t* rem, uint64_t k) {
     if (p > 2 * k) 
     {
         uint64_t c = start_c;
@@ -174,7 +172,7 @@ inline void process_p_dyn(uint64_t p, uint64_t magic, uint64_t start_c, uint64_t
                     uint64_t temp = c;
                     while (temp > 0) 
                     {
-                        uint64_t q = ((unsigned __int128)temp * magic) >> 64; // temp / p
+                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); // temp / p
                         if (temp - q * p != 0) // temp % p != 0
                             break;
                         ++nu;
@@ -184,19 +182,12 @@ inline void process_p_dyn(uint64_t p, uint64_t magic, uint64_t start_c, uint64_t
                     uint64_t carry = 0;
                     while (temp > 0) 
                     {
-                        uint64_t q = ((unsigned __int128)temp * magic) >> 64; // temp / p
+                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); // temp / p
                         uint64_t digit = temp - q * p; // temp % p
-                        if (digit * 2 + carry >= p) 
-                        {
-                            ++carries;
-                            carry = 1;
-                            if (carries > nu)
-                                break;
-                        } 
-                        else 
-                        {
-                            carry = 0;
-                        }
+                        carry = (digit * 2 + carry >= p);
+                        carries += carry;
+                        if (carries > nu)
+                            break;
                         temp = q;
                     }
                     if (carries <= nu)
@@ -208,13 +199,14 @@ inline void process_p_dyn(uint64_t p, uint64_t magic, uint64_t start_c, uint64_t
                 } 
                 else 
                 {
-                    uint64_t temp = ((unsigned __int128)rem[j] * magic) >> 64;
+                    uint64_t temp = (uint64_t)((((unsigned __int128)rem[j] * magic) >> 64) >> shift); // temp / p
                     if (temp > 0) 
                     {
                         while (true) 
                         {
-                            uint64_t q = ((unsigned __int128)temp * magic) >> 64;
-                            if (temp - q * p != 0) break;
+                            uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); // temp / p
+                            if (temp - q * p != 0) // temp % p != 0
+                                break;
                             temp = q;
                         }
                     }
@@ -229,13 +221,14 @@ inline void process_p_dyn(uint64_t p, uint64_t magic, uint64_t start_c, uint64_t
         {
             if (valid[j]) 
             {
-                uint64_t temp = ((unsigned __int128)rem[j] * magic) >> 64;
+                uint64_t temp = (uint64_t)((((unsigned __int128)rem[j] * magic) >> 64) >> shift); // temp / p
                 if (temp > 0) 
                 {
                     while (true) 
                     {
-                        uint64_t q = ((unsigned __int128)temp * magic) >> 64;
-                        if (temp - q * p != 0) break;
+                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); // temp / p
+                        if (temp - q * p != 0) // temp % p != 0
+                            break;
                         temp = q;
                     }
                 }
@@ -319,7 +312,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                         PROCESS_PRIME(181) PROCESS_PRIME(191) PROCESS_PRIME(193) PROCESS_PRIME(197)
                         PROCESS_PRIME(199)
                         default:
-                            process_p_dyn(p, prime_magics[idx], start_c, start_j, W_block, valid.data(), rem.data(), k);
+                            process_p_dyn(p, prime_magics[idx], prime_shifts[idx], start_c, start_j, W_block, valid.data(), rem.data(), k);
                             break;
                     }
                 }
@@ -371,7 +364,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
             fout << k << " " << L_batch << "\n";
             fout.close();
             std::error_code ec;
-            std::filesystem::rename("checkpoint.tmp", "checkpoint.txt", ec);
+            std::filesystem::rename("checkpoint.tmp", "checkpoint-master.txt", ec);
         }
     }
 }
@@ -389,9 +382,9 @@ int main()
     uint64_t start_k = 1;
     uint64_t start_L = 1;
 
-    if (std::filesystem::exists("checkpoint.txt")) 
+    if (std::filesystem::exists("checkpoint-master.txt")) 
     {
-        std::ifstream fin("checkpoint.txt");
+        std::ifstream fin("checkpoint-master.txt");
         if (fin >> start_k >> start_L) 
         {
             std::cout << "--> Resuming from Checkpoint: k = " << start_k << ", L_batch = " << start_L << "\n\n";
@@ -423,7 +416,7 @@ int main()
         
         std::string output_str = oss.str();
         std::cout << output_str;
-        std::ofstream results_file("results.txt", std::ios::app);
+        std::ofstream results_file("results-master.txt", std::ios::app);
         if (results_file)
             results_file << output_str;
 
@@ -434,12 +427,12 @@ int main()
             fout << (k + 1) << " " << start_L << "\n";
             fout.close();
             std::error_code ec;
-            std::filesystem::rename("checkpoint.tmp", "checkpoint.txt", ec);
+            std::filesystem::rename("checkpoint.tmp", "checkpoint-master.txt", ec);
         }
     }
     
     std::error_code ec;
-    std::filesystem::remove("checkpoint.txt", ec);
+    std::filesystem::remove("checkpoint-master.txt", ec);
     
     return 0;
 }
