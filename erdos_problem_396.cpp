@@ -19,6 +19,7 @@
 const unsigned int NUM_THREADS = std::thread::hardware_concurrency(); // 8
 const unsigned int NUM_SEQ = 2;
 std::vector<uint64_t> primes;
+std::vector<uint64_t> prime_magics;
 
 void get_primes(uint64_t limit) 
 {
@@ -35,8 +36,11 @@ void get_primes(uint64_t limit)
     }
     for (uint64_t p = 2; p <= limit; ++p) 
     {
-        if (sieve[p])
+        if (sieve[p]) 
+        {
             primes.push_back(p);
+            prime_magics.push_back((uint64_t)(((unsigned __int128)1 << 64) / p + 1));
+        }
     }
 }
 
@@ -151,7 +155,7 @@ inline void process_prime_p(uint64_t start_c, uint64_t start_j, uint64_t W_block
     }
 }
 
-inline void process_p_dyn(uint64_t p, uint64_t start_c, uint64_t start_j, uint64_t W_block, uint8_t* valid, uint64_t* rem, uint64_t k) {
+inline void process_p_dyn(uint64_t p, uint64_t magic, uint64_t start_c, uint64_t start_j, uint64_t W_block, uint8_t* valid, uint64_t* rem, uint64_t k) {
     if (p > 2 * k) 
     {
         uint64_t c = start_c;
@@ -168,16 +172,20 @@ inline void process_p_dyn(uint64_t p, uint64_t start_c, uint64_t start_j, uint64
                 {
                     uint64_t nu = 0;
                     uint64_t temp = c;
-                    while (temp > 0 && temp % p == 0) 
+                    while (temp > 0) 
                     {
+                        uint64_t q = ((unsigned __int128)temp * magic) >> 64; // temp / p
+                        if (temp - q * p != 0) // temp % p != 0
+                            break;
                         ++nu;
-                        temp /= p;
+                        temp = q;
                     }
                     uint64_t carries = 0;
                     uint64_t carry = 0;
                     while (temp > 0) 
                     {
-                        uint64_t digit = temp % p;
+                        uint64_t q = ((unsigned __int128)temp * magic) >> 64; // temp / p
+                        uint64_t digit = temp - q * p; // temp % p
                         if (digit * 2 + carry >= p) 
                         {
                             ++carries;
@@ -189,7 +197,7 @@ inline void process_p_dyn(uint64_t p, uint64_t start_c, uint64_t start_j, uint64
                         {
                             carry = 0;
                         }
-                        temp /= p;
+                        temp = q;
                     }
                     if (carries <= nu)
                         is_val = false;
@@ -200,11 +208,15 @@ inline void process_p_dyn(uint64_t p, uint64_t start_c, uint64_t start_j, uint64
                 } 
                 else 
                 {
-                    uint64_t temp = rem[j] / p;
+                    uint64_t temp = ((unsigned __int128)rem[j] * magic) >> 64;
                     if (temp > 0) 
                     {
-                        while (temp % p == 0)
-                            temp /= p;
+                        while (true) 
+                        {
+                            uint64_t q = ((unsigned __int128)temp * magic) >> 64;
+                            if (temp - q * p != 0) break;
+                            temp = q;
+                        }
                     }
                     rem[j] = temp;
                 }
@@ -217,11 +229,15 @@ inline void process_p_dyn(uint64_t p, uint64_t start_c, uint64_t start_j, uint64
         {
             if (valid[j]) 
             {
-                uint64_t temp = rem[j] / p;
+                uint64_t temp = ((unsigned __int128)rem[j] * magic) >> 64;
                 if (temp > 0) 
                 {
-                    while (temp % p == 0)
-                        temp /= p;
+                    while (true) 
+                    {
+                        uint64_t q = ((unsigned __int128)temp * magic) >> 64;
+                        if (temp - q * p != 0) break;
+                        temp = q;
+                    }
                 }
                 rem[j] = temp;
             }
@@ -267,14 +283,19 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 uint64_t block_R = std::min(R_chunk, block_L + BLOCK_SIZE - 1);
                 uint64_t W_block = block_R - block_L + 1;
                 
-                for (uint64_t j = 0; j < W_block; ++j) 
+                uint64_t x = block_L;
+                for (uint64_t j = 0; j < W_block; ++j, ++x) 
                 {
-                    rem[j] = block_L + j;
                     valid[j] = 1;
+                    rem[j] = x >> std::countr_zero(x);
                 }
 
-                for (uint64_t p : primes) 
+                size_t total_primes = primes.size();
+                for (size_t idx = 0; idx < total_primes; ++idx) 
                 {
+                    uint64_t p = primes[idx];
+                    if (p == 2)
+                        continue;
                     if (p > max_p)
                         break;
                     
@@ -282,20 +303,6 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                     uint64_t start_j = start_c * p - block_L;
                     if (start_j >= W_block)
                         continue;
-
-                    if (p == 2) 
-                    {
-                        for (uint64_t j = start_j; j < W_block; j += 2) 
-                        {
-                            if (valid[j]) 
-                            {
-                                uint64_t temp = rem[j];
-                                temp >>= std::countr_zero(temp);
-                                rem[j] = temp;
-                            }
-                        }
-                        continue;
-                    }
 
                     switch (p) 
                     {
@@ -312,7 +319,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                         PROCESS_PRIME(181) PROCESS_PRIME(191) PROCESS_PRIME(193) PROCESS_PRIME(197)
                         PROCESS_PRIME(199)
                         default:
-                            process_p_dyn(p, start_c, start_j, W_block, valid.data(), rem.data(), k);
+                            process_p_dyn(p, prime_magics[idx], start_c, start_j, W_block, valid.data(), rem.data(), k);
                             break;
                     }
                 }

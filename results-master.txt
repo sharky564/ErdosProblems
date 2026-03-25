@@ -8,3 +8,4 @@ k =  7 | min n =       101130029 | Time:       0.5378 s | Speed:   173.21 M cand
 k =  8 | min n =       339949252 | Time:       1.1456 s | Speed:   208.46 M candidates/s
 k =  9 | min n =      1019547844 | Time:       2.9081 s | Speed:   233.70 M candidates/s
 k = 10 | min n =     17609764994 | Time:      82.2192 s | Speed:   172.59 M candidates/s
+k = 11 | min n =   1070858041585 | Time:    8399.7190 s | Speed:   125.39 M candidates/s
