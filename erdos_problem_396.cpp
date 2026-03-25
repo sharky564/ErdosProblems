@@ -416,7 +416,7 @@ int main()
         
         std::string output_str = oss.str();
         std::cout << output_str;
-        std::ofstream results_file("results-master.txt", std::ios::app);
+        std::ofstream results_file("results-396-master.txt", std::ios::app);
         if (results_file)
             results_file << output_str;
 
