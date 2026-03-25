@@ -358,13 +358,13 @@ uint64_t solve(uint64_t k, uint64_t start_L)
             return global_min_n.load();
 
         L_batch += CHUNKS_PER_BATCH * CHUNK_SIZE;
-        std::ofstream fout("checkpoint.tmp");
+        std::ofstream fout("checkpoint-396.tmp");
         if (fout) 
         {
             fout << k << " " << L_batch << "\n";
             fout.close();
             std::error_code ec;
-            std::filesystem::rename("checkpoint.tmp", "checkpoint-master.txt", ec);
+            std::filesystem::rename("checkpoint-396.tmp", "checkpoint-396-master.txt", ec);
         }
     }
 }
@@ -382,9 +382,9 @@ int main()
     uint64_t start_k = 1;
     uint64_t start_L = 1;
 
-    if (std::filesystem::exists("checkpoint-master.txt")) 
+    if (std::filesystem::exists("checkpoint-396-master.txt")) 
     {
-        std::ifstream fin("checkpoint-master.txt");
+        std::ifstream fin("checkpoint-396-master.txt");
         if (fin >> start_k >> start_L) 
         {
             std::cout << "--> Resuming from Checkpoint: k = " << start_k << ", L_batch = " << start_L << "\n\n";
@@ -421,18 +421,18 @@ int main()
             results_file << output_str;
 
         start_L = ans;
-        std::ofstream fout("checkpoint.tmp");
+        std::ofstream fout("checkpoint-396.tmp");
         if (fout) 
         {
             fout << (k + 1) << " " << start_L << "\n";
             fout.close();
             std::error_code ec;
-            std::filesystem::rename("checkpoint.tmp", "checkpoint-master.txt", ec);
+            std::filesystem::rename("checkpoint-396.tmp", "checkpoint-396-master.txt", ec);
         }
     }
     
     std::error_code ec;
-    std::filesystem::remove("checkpoint-master.txt", ec);
+    std::filesystem::remove("checkpoint-396-master.txt", ec);
     
     return 0;
 }
