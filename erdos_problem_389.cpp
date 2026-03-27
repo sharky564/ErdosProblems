@@ -175,7 +175,8 @@ bool is_valid(uint64_t N, uint64_t m) {
                 temp = q; 
             }
             
-            if (s_2Nm + s_m > 2 * s_N) return false;
+            if (s_2Nm + s_m > 2 * s_N)
+                return false;
         }
     }
 
@@ -362,7 +363,8 @@ uint64_t solve_new(uint64_t n, uint64_t start_L)
         std::vector<std::thread> threads;
         for (unsigned int i = 0; i < NUM_THREADS; ++i)
             threads.emplace_back(worker, std::ref(current_chunk));
-        for (auto& t : threads) t.join();
+        for (auto& t : threads)
+            t.join();
 
         if (found_in_batch)
             return global_min_k.load();
@@ -380,7 +382,8 @@ uint64_t solve_new(uint64_t n, uint64_t start_L)
     }
 }
 
-int main() {
+int main() 
+{
     std::cout << "Detected " << NUM_THREADS << " logical cores. Using C++ Thread Pool...\n";
     std::cout << "Generating primes up to 200,000,000..." << std::endl;
     auto start_primes = std::chrono::high_resolution_clock::now();
