@@ -13,6 +13,7 @@
 #include <fstream>
 #include <filesystem>
 #include <sstream>
+#include <cstdlib>
 
 const unsigned int NUM_THREADS = std::thread::hardware_concurrency();
 
@@ -23,6 +24,45 @@ struct PrimeData
     uint64_t limit;
     uint32_t p;
     uint8_t shift;
+};
+
+struct BucketItem
+{
+    uint32_t p_idx;
+    uint32_t offset;
+};
+
+struct FastBucket
+{
+    BucketItem* data;
+    uint32_t count;
+    uint32_t cap;
+
+    FastBucket()
+    {
+        cap = 16384;
+        data = static_cast<BucketItem*>(std::malloc(cap * sizeof(BucketItem)));
+        count = 0;
+    }
+
+    ~FastBucket() { std::free(data); }
+
+    FastBucket(const FastBucket&) = delete;
+    FastBucket& operator=(const FastBucket&) = delete;
+
+    inline void clear() { count = 0; }
+
+    inline void push_back(uint32_t p_idx, uint32_t offset)
+    {
+        if (count == cap) [[unlikely]]
+        {
+            cap *= 2;
+            data = static_cast<BucketItem*>(std::realloc(data, cap * sizeof(BucketItem)));
+        }
+        data[count].p_idx = p_idx;
+        data[count].offset = offset;
+        ++count;
+    }
 };
 
 std::vector<PrimeData> primes;
@@ -225,12 +265,6 @@ uint64_t solve(uint64_t k, uint64_t start_L)
     std::atomic<uint64_t> current_chunk{0};
     std::atomic<uint64_t> global_min_n{static_cast<uint64_t>(-1)};
 
-    struct BucketItem
-    {
-        uint32_t p_idx;
-        uint32_t offset;
-    };
-
     auto worker = [&]() {
         const uint32_t OPT_BLOCK_SIZE = 32768;
         const uint32_t BLOCK_SHIFT = 15;
@@ -239,9 +273,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
         std::vector<uint64_t> rem(OPT_BLOCK_SIZE + 32);
         std::vector<uint32_t> prime_offsets;
 
-        std::vector<BucketItem> buckets[33];
-        for (int i = 0; i < 33; ++i)
-            buckets[i].reserve(16384);
+        FastBucket buckets[33];
 
         while (true)
         {
@@ -260,8 +292,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
             if (prime_offsets.size() < chunk_total_primes)
                 prime_offsets.resize(chunk_total_primes);
 
-            auto it_large = std::upper_bound(primes.begin(), primes.begin() + chunk_total_primes, OPT_BLOCK_SIZE,
-                [](uint32_t val, const PrimeData& pd) { return val < pd.p; });
+            auto it_large = std::upper_bound(primes.begin(), primes.begin() + chunk_total_primes, OPT_BLOCK_SIZE,[](uint32_t val, const PrimeData& pd) { return val < pd.p; });
             size_t first_large_prime_idx = std::distance(primes.begin(), it_large);
 
             for (size_t idx = 1; idx < chunk_total_primes; ++idx)
@@ -283,7 +314,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 uint32_t p = primes[idx].p;
                 while (start_j < CHUNK_W)
                 {
-                    buckets[start_j >> BLOCK_SHIFT].push_back({(uint32_t)idx, (uint32_t)(start_j & BLOCK_MASK)});
+                    buckets[start_j >> BLOCK_SHIFT].push_back((uint32_t)idx, (uint32_t)(start_j & BLOCK_MASK));
                     start_j += p;
                 }
             }
@@ -336,12 +367,21 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                     }
                 }
 
-                for (const auto& item : buckets[block_idx])
-                {
-                    uint64_t inv_p = primes[item.p_idx].inv_p;
-                    uint64_t limit = primes[item.p_idx].limit;
+                uint32_t b_count = buckets[block_idx].count;
+                BucketItem* b_items = buckets[block_idx].data;
 
-                    uint64_t temp = rem_ptr[item.offset] * inv_p;
+                for (uint32_t i = 0; i < b_count; ++i)
+                {
+                    if (i + 8 < b_count) [[likely]]
+                        __builtin_prefetch(&primes[b_items[i + 8].p_idx], 0, 1);
+
+                    uint32_t p_idx = b_items[i].p_idx;
+                    uint32_t offset = b_items[i].offset;
+
+                    uint64_t inv_p = primes[p_idx].inv_p;
+                    uint64_t limit = primes[p_idx].limit;
+
+                    uint64_t temp = rem_ptr[offset] * inv_p;
                     uint64_t q = temp * inv_p;
                     if (q <= limit) [[unlikely]]
                     {
@@ -354,7 +394,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                             temp = q;
                         }
                     }
-                    rem_ptr[item.offset] = temp;
+                    rem_ptr[offset] = temp;
                 }
 
                 uint32_t W_search = overlap + num_new;
