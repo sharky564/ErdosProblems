@@ -42,16 +42,14 @@ Detected 8 logical cores. Using C++ Thread Pool...
 Generating primes up to 200,000,000...
 Primes generated in 1.50658 seconds.
 
-k =  1 | min n =               2 | Time:       0.0061 s | Speed:     0.00 M candidates/s
+k =  1 | min n =               2 | Time:       0.0066 s | Speed:     0.00 M candidates/s
 k =  2 | min n =            2480 | Time:       0.0058 s | Speed:     0.43 M candidates/s
 k =  3 | min n =            8178 | Time:       0.0057 s | Speed:     1.00 M candidates/s
-k =  4 | min n =           45153 | Time:       0.0059 s | Speed:     6.32 M candidates/s
-k =  5 | min n =         3648841 | Time:       0.0069 s | Speed:   524.41 M candidates/s
-k =  6 | min n =         7979090 | Time:       0.0053 s | Speed:   810.36 M candidates/s
-k =  7 | min n =       101130029 | Time:       0.0470 s | Speed:  1982.31 M candidates/s
-k =  8 | min n =       339949252 | Time:       0.1136 s | Speed:  2102.47 M candidates/s
-k =  9 | min n =      1019547844 | Time:       0.3701 s | Speed:  1836.13 M candidates/s
-k = 10 | min n =     17609764994 | Time:      12.1744 s | Speed:  1362.71 M candidates/s
-k = 11 | min n =   1070858041585 | Time:    1519.3958 s | Speed:   691.83 M candidates/s
-k = 12 | min n =   5048891644646 | Time:   11235.0038 s | Speed:   354.07 M candidates/s
+k =  4 | min n =           45153 | Time:       0.0064 s | Speed:     5.74 M candidates/s
+k =  5 | min n =         3648841 | Time:       0.0083 s | Speed:   432.91 M candidates/s
+k =  6 | min n =         7979090 | Time:       0.0068 s | Speed:   638.54 M candidates/s
+k =  7 | min n =       101130029 | Time:       0.0467 s | Speed:  1994.75 M candidates/s
+k =  8 | min n =       339949252 | Time:       0.1123 s | Speed:  2127.00 M candidates/s
+k =  9 | min n =      1019547844 | Time:       0.3260 s | Speed:  2084.66 M candidates/s
+k = 10 | min n =     17609764994 | Time:      10.8138 s | Speed:  1534.17 M candidates/s
 ```

@@ -7,8 +7,6 @@
 #include <algorithm>
 #include <atomic>
 #include <thread>
-#include <ranges>
-#include <span>
 #include <chrono>
 #include <iomanip>
 #include <bit>
@@ -224,14 +222,26 @@ inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t& 
 uint64_t solve(uint64_t k, uint64_t start_L)
 {
     const uint64_t CHUNK_SIZE = 1048576;
-    const uint64_t BLOCK_SIZE = 65536;
-
     std::atomic<uint64_t> current_chunk{0};
     std::atomic<uint64_t> global_min_n{static_cast<uint64_t>(-1)};
 
+    struct BucketItem
+    {
+        uint32_t p_idx;
+        uint32_t offset;
+    };
+
     auto worker = [&]() {
-        std::vector<uint64_t> rem(BLOCK_SIZE + 32);
+        const uint32_t OPT_BLOCK_SIZE = 32768;
+        const uint32_t BLOCK_SHIFT = 15;
+        const uint32_t BLOCK_MASK = 32767;
+
+        std::vector<uint64_t> rem(OPT_BLOCK_SIZE + 32);
         std::vector<uint32_t> prime_offsets;
+
+        std::vector<BucketItem> buckets[33];
+        for (int i = 0; i < 33; ++i)
+            buckets[i].reserve(16384);
 
         while (true)
         {
@@ -242,12 +252,17 @@ uint64_t solve(uint64_t k, uint64_t start_L)
             if (L_chunk > global_min_n.load(std::memory_order_relaxed))
                 break;
 
+            uint32_t CHUNK_W = (uint32_t)(R_chunk - L_chunk + 1);
             uint64_t max_p = std::max<uint64_t>(std::sqrt(2 * R_chunk) + 1, 2 * k);
             auto it = std::upper_bound(primes.begin(), primes.end(), max_p,[](uint64_t val, const PrimeData& pd) { return val < pd.p; });
             size_t chunk_total_primes = std::distance(primes.begin(), it);
 
             if (prime_offsets.size() < chunk_total_primes)
                 prime_offsets.resize(chunk_total_primes);
+
+            auto it_large = std::upper_bound(primes.begin(), primes.begin() + chunk_total_primes, OPT_BLOCK_SIZE,
+                [](uint32_t val, const PrimeData& pd) { return val < pd.p; });
+            size_t first_large_prime_idx = std::distance(primes.begin(), it_large);
 
             for (size_t idx = 1; idx < chunk_total_primes; ++idx)
             {
@@ -260,81 +275,86 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 prime_offsets[idx] = (uint32_t)(start_c * p - L_chunk);
             }
 
+            for (int i = 0; i < 33; ++i) buckets[i].clear();
+
+            for (size_t idx = first_large_prime_idx; idx < chunk_total_primes; ++idx)
+            {
+                uint64_t start_j = prime_offsets[idx];
+                uint32_t p = primes[idx].p;
+                while (start_j < CHUNK_W)
+                {
+                    buckets[start_j >> BLOCK_SHIFT].push_back({(uint32_t)idx, (uint32_t)(start_j & BLOCK_MASK)});
+                    start_j += p;
+                }
+            }
+
             uint32_t overlap = 0;
             uint32_t j = 0;
 
-            for (uint64_t block_L = L_chunk; block_L <= R_chunk; block_L += BLOCK_SIZE)
+            for (uint32_t block_start = 0; block_start < CHUNK_W; block_start += OPT_BLOCK_SIZE)
             {
-                uint64_t block_R = std::min(R_chunk, block_L + BLOCK_SIZE - 1);
+                uint32_t block_idx = block_start >> BLOCK_SHIFT;
+                uint64_t block_L = L_chunk + block_start;
+                uint64_t block_R = std::min(R_chunk, block_L + OPT_BLOCK_SIZE - 1);
                 uint32_t num_new = (uint32_t)(block_R - block_L + 1);
 
                 uint64_t x = block_L;
                 for (uint32_t idx_new = 0; idx_new < num_new; ++idx_new, ++x)
                     rem[overlap + idx_new] = x >> std::countr_zero(x);
 
-                for (size_t idx = 1; idx < chunk_total_primes; ++idx)
+                uint64_t* rem_ptr = rem.data() + overlap;
+
+                for (size_t idx = 1; idx < first_large_prime_idx; ++idx)
                 {
                     uint32_t p = primes[idx].p;
                     uint32_t start_j = prime_offsets[idx];
 
-                    uint64_t* rem_ptr = rem.data() + overlap;
-
-                    if (p <= num_new)
+                    if (start_j < num_new)
                     {
-                        if (start_j < num_new)
-                        {
-                            uint64_t inv_p = primes[idx].inv_p;
-                            uint64_t limit = primes[idx].limit;
+                        uint64_t inv_p = primes[idx].inv_p;
+                        uint64_t limit = primes[idx].limit;
 
-                            #define PROCESS_PRIME(p_val) \
-                                case p_val: process_prime_p<p_val>(start_j, num_new, rem_ptr); break;
+                        #define PROCESS_PRIME(p_val) \
+                            case p_val: process_prime_p<p_val>(start_j, num_new, rem_ptr); break;
 
-                            switch (p)
-                            {
-                                PROCESS_PRIME(3) PROCESS_PRIME(5) PROCESS_PRIME(7) PROCESS_PRIME(11)
-                                PROCESS_PRIME(13) PROCESS_PRIME(17) PROCESS_PRIME(19) PROCESS_PRIME(23)
-                                PROCESS_PRIME(29) PROCESS_PRIME(31) PROCESS_PRIME(37) PROCESS_PRIME(41)
-                                PROCESS_PRIME(43) PROCESS_PRIME(47) PROCESS_PRIME(53) PROCESS_PRIME(59)
-                                PROCESS_PRIME(61) PROCESS_PRIME(67) PROCESS_PRIME(71) PROCESS_PRIME(73)
-                                PROCESS_PRIME(79) PROCESS_PRIME(83) PROCESS_PRIME(89) PROCESS_PRIME(97)
-                                default: process_p_dyn(p, inv_p, limit, start_j, num_new, rem_ptr);
-                            }
-                            #undef PROCESS_PRIME
-                            prime_offsets[idx] = start_j;
-                        }
-                        else
+                        switch (p)
                         {
-                            prime_offsets[idx] = start_j - num_new;
+                            PROCESS_PRIME(3) PROCESS_PRIME(5) PROCESS_PRIME(7) PROCESS_PRIME(11)
+                            PROCESS_PRIME(13) PROCESS_PRIME(17) PROCESS_PRIME(19) PROCESS_PRIME(23)
+                            PROCESS_PRIME(29) PROCESS_PRIME(31) PROCESS_PRIME(37) PROCESS_PRIME(41)
+                            PROCESS_PRIME(43) PROCESS_PRIME(47) PROCESS_PRIME(53) PROCESS_PRIME(59)
+                            PROCESS_PRIME(61) PROCESS_PRIME(67) PROCESS_PRIME(71) PROCESS_PRIME(73)
+                            PROCESS_PRIME(79) PROCESS_PRIME(83) PROCESS_PRIME(89) PROCESS_PRIME(97)
+                            default: process_p_dyn(p, inv_p, limit, start_j, num_new, rem_ptr);
                         }
+                        #undef PROCESS_PRIME
+                        prime_offsets[idx] = start_j;
                     }
                     else
                     {
-                        for (; idx < chunk_total_primes; ++idx)
+                        prime_offsets[idx] = start_j - num_new;
+                    }
+                }
+
+                for (const auto& item : buckets[block_idx])
+                {
+                    uint64_t inv_p = primes[item.p_idx].inv_p;
+                    uint64_t limit = primes[item.p_idx].limit;
+
+                    uint64_t temp = rem_ptr[item.offset] * inv_p;
+                    uint64_t q = temp * inv_p;
+                    if (q <= limit) [[unlikely]]
+                    {
+                        temp = q;
+                        while (true)
                         {
-                            uint32_t start_j = prime_offsets[idx];
-                            if (start_j < num_new)
-                            {
-                                uint64_t temp = rem_ptr[start_j] * primes[idx].inv_p;
-                                uint64_t q = temp * primes[idx].inv_p;
-                                if (q <= primes[idx].limit) [[unlikely]]
-                                {
-                                    temp = q;
-                                    while (true)
-                                    {
-                                        q = temp * primes[idx].inv_p;
-                                        if (q > primes[idx].limit) break;
-                                        temp = q;
-                                    }
-                                }
-                                rem_ptr[start_j] = temp;
-                                prime_offsets[idx] = start_j + primes[idx].p - num_new;
-                            }
-                            else
-                            {
-                                prime_offsets[idx] = start_j - num_new;
-                            }
+                            q = temp * inv_p;
+                            if (q > limit)
+                                break;
+                            temp = q;
                         }
                     }
+                    rem_ptr[item.offset] = temp;
                 }
 
                 uint32_t W_search = overlap + num_new;
@@ -376,7 +396,6 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 }
             }
 
-            // Background checkpointing
             static std::atomic<bool> is_writing{false};
             if (chunk_id > NUM_THREADS && chunk_id % 1000 == 0)
             {
@@ -384,13 +403,13 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 if (is_writing.compare_exchange_strong(expected, true))
                 {
                     uint64_t safe_L = start_L + (chunk_id - NUM_THREADS) * CHUNK_SIZE;
-                    std::ofstream fout("checkpoint-396-master.tmp");
+                    std::ofstream fout("checkpoint-396.tmp");
                     if (fout)
                     {
                         fout << k << " " << safe_L << "\n";
                         fout.close();
                         std::error_code ec;
-                        std::filesystem::rename("checkpoint-396-master.tmp", "checkpoint-396-master.txt", ec);
+                        std::filesystem::rename("checkpoint-396.tmp", "checkpoint-396.txt", ec);
                     }
                     is_writing.store(false, std::memory_order_release);
                 }
@@ -420,9 +439,9 @@ int main()
     uint64_t start_k = 1;
     uint64_t start_L = 1;
 
-    if (std::filesystem::exists("checkpoint-396-master.txt"))
+    if (std::filesystem::exists("checkpoint-396.txt"))
     {
-        std::ifstream fin("checkpoint-396-master.txt");
+        std::ifstream fin("checkpoint-396.txt");
         if (fin >> start_k >> start_L)
         {
             std::cout << "--> Resuming from checkpoint: k = " << start_k << ", L_batch = " << start_L << "\n\n";
@@ -454,23 +473,23 @@ int main()
 
         std::string output_str = oss.str();
         std::cout << output_str;
-        std::ofstream results_file("results-396-master.txt", std::ios::app);
+        std::ofstream results_file("results-396.txt", std::ios::app);
         if (results_file)
             results_file << output_str;
 
         start_L = ans;
-        std::ofstream fout("checkpoint-396-master.tmp");
+        std::ofstream fout("checkpoint-396.tmp");
         if (fout)
         {
             fout << (k + 1) << " " << start_L << "\n";
             fout.close();
             std::error_code ec;
-            std::filesystem::rename("checkpoint-396-master.tmp", "checkpoint-396-master.txt", ec);
+            std::filesystem::rename("checkpoint-396.tmp", "checkpoint-396.txt", ec);
         }
     }
 
     std::error_code ec;
-    std::filesystem::remove("checkpoint-396-master.txt", ec);
+    std::filesystem::remove("checkpoint-396.txt", ec);
 
     return 0;
 }
