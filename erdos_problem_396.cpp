@@ -15,15 +15,14 @@
 #include <fstream>
 #include <filesystem>
 #include <sstream>
-#include <barrier>
-#include <immintrin.h>
 
 const unsigned int NUM_THREADS = std::thread::hardware_concurrency();
-const unsigned int NUM_SEQ = 4;
 
-struct alignas(16) PrimeData
+struct PrimeData
 {
     uint64_t magic;
+    uint64_t inv_p;
+    uint64_t limit;
     uint32_t p;
     uint8_t shift;
 };
@@ -49,7 +48,15 @@ void get_primes(uint32_t limit)
         {
             uint8_t shift = std::bit_width(p) - 1;
             unsigned __int128 magic_128 = ((unsigned __int128)1 << (64 + shift)) / p + 1;
-            primes.push_back({(uint64_t)magic_128, p, shift});
+
+            uint64_t inv = 0;
+            if (p % 2 != 0)
+            {
+                inv = p;
+                for (int i = 0; i < 5; ++i)
+                    inv *= 2 - p * inv;
+            }
+            primes.push_back({(uint64_t)magic_128, inv, UINT64_MAX / p, p, shift});
         }
     }
 }
@@ -89,10 +96,17 @@ bool exact_check(uint64_t n, uint64_t k)
         for (const auto& pd : primes)
         {
             uint32_t p = pd.p;
+            if (p == 2)
+                continue;
+
             if (p <= 2 * k)
             {
-                while (temp % p == 0)
-                    temp /= p;
+                uint64_t q = temp * pd.inv_p;
+                while (q <= pd.limit)
+                {
+                    temp = q;
+                    q = temp * pd.inv_p;
+                }
                 continue;
             }
             if (p * p > temp)
@@ -123,13 +137,15 @@ bool exact_check(uint64_t n, uint64_t k)
                 }
                 break;
             }
-            if (temp % p == 0)
+            uint64_t q = temp * pd.inv_p;
+            if (q <= pd.limit)
             {
                 uint64_t nu_prod = 0;
-                while (temp % p == 0)
+                while (q <= pd.limit)
                 {
                     nu_prod++;
-                    temp /= p;
+                    temp = q;
+                    q = temp * pd.inv_p;
                 }
 
                 uint64_t nu_comb = 0;
@@ -153,36 +169,49 @@ bool exact_check(uint64_t n, uint64_t k)
 template<uint32_t p>
 inline void process_prime_p(uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
+    constexpr uint64_t inv_p = []() {
+        uint64_t inv = p;
+        for (int i = 0; i < 5; ++i)
+            inv *= 2 - p * inv;
+        return inv;
+    }();
+    constexpr uint64_t limit = UINT64_MAX / p;
+
     uint32_t j = start_j;
     for (; j < W_block; j += p)
     {
-        uint64_t temp = rem[j] / p;
-        if (temp % p == 0) [[unlikely]]
+        uint64_t temp = rem[j] * inv_p;
+        uint64_t q = temp * inv_p;
+        if (q <= limit) [[unlikely]]
         {
-            temp /= p;
-            while (temp % p == 0)
-                temp /= p;
+            temp = q;
+            while (true)
+            {
+                q = temp * inv_p;
+                if (q > limit)
+                    break;
+                temp = q;
+            }
         }
         rem[j] = temp;
     }
     start_j = j - W_block;
 }
 
-inline void process_p_dyn(uint32_t p, uint64_t magic, uint8_t shift, uint32_t& start_j, uint32_t W_block, uint64_t* rem)
+inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
     uint32_t j = start_j;
     for (; j < W_block; j += p)
     {
-        uint64_t temp = (uint64_t)((((unsigned __int128)rem[j] * magic) >> 64) >> shift);
-
-        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift);
-        if (temp - q * p == 0) [[unlikely]]
+        uint64_t temp = rem[j] * inv_p;
+        uint64_t q = temp * inv_p;
+        if (q <= limit) [[unlikely]]
         {
             temp = q;
             while (true)
             {
-                q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift);
-                if (temp - q * p != 0)
+                q = temp * inv_p;
+                if (q > limit)
                     break;
                 temp = q;
             }
@@ -194,14 +223,14 @@ inline void process_p_dyn(uint32_t p, uint64_t magic, uint8_t shift, uint32_t& s
 
 uint64_t solve(uint64_t k, uint64_t start_L)
 {
-    const uint64_t CHUNK_SIZE = 1000000;
+    const uint64_t CHUNK_SIZE = 1048576;
     const uint64_t BLOCK_SIZE = 65536;
 
     std::atomic<uint64_t> current_chunk{0};
     std::atomic<uint64_t> global_min_n{static_cast<uint64_t>(-1)};
 
     auto worker = [&]() {
-        alignas(32) std::vector<uint64_t> rem(BLOCK_SIZE);
+        std::vector<uint64_t> rem(BLOCK_SIZE + 32);
         std::vector<uint32_t> prime_offsets;
 
         while (true)
@@ -231,14 +260,18 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 prime_offsets[idx] = (uint32_t)(start_c * p - L_chunk);
             }
 
+            uint32_t overlap = 0;
+            uint32_t j = 0;
+
             for (uint64_t block_L = L_chunk; block_L <= R_chunk; block_L += BLOCK_SIZE)
             {
                 uint64_t block_R = std::min(R_chunk, block_L + BLOCK_SIZE - 1);
-                uint32_t W_block = (uint32_t)(block_R - block_L + 1);
+                uint32_t num_new = (uint32_t)(block_R - block_L + 1);
 
                 uint64_t x = block_L;
-                for (uint32_t j = 0; j < W_block; ++j, ++x) {
-                    rem[j] = x >> std::countr_zero(x);
+                for (uint32_t idx_new = 0; idx_new < num_new; ++idx_new, ++x)
+                {
+                    rem[overlap + idx_new] = x >> std::countr_zero(x);
                 }
 
                 for (size_t idx = 1; idx < chunk_total_primes; ++idx)
@@ -246,13 +279,14 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                     uint32_t p = primes[idx].p;
                     uint32_t start_j = prime_offsets[idx];
 
-                    if (start_j < W_block)
+                    if (start_j < num_new)
                     {
-                        uint64_t magic = primes[idx].magic;
-                        uint8_t shift = primes[idx].shift;
+                        uint64_t inv_p = primes[idx].inv_p;
+                        uint64_t limit = primes[idx].limit;
+                        uint64_t* rem_ptr = rem.data() + overlap;
 
                         #define PROCESS_PRIME(p_val) \
-                            case p_val: process_prime_p<p_val>(start_j, W_block, rem.data()); break;
+                            case p_val: process_prime_p<p_val>(start_j, num_new, rem_ptr); break;
 
                         switch (p)
                         {
@@ -262,21 +296,21 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                             PROCESS_PRIME(43) PROCESS_PRIME(47) PROCESS_PRIME(53) PROCESS_PRIME(59)
                             PROCESS_PRIME(61) PROCESS_PRIME(67) PROCESS_PRIME(71) PROCESS_PRIME(73)
                             PROCESS_PRIME(79) PROCESS_PRIME(83) PROCESS_PRIME(89) PROCESS_PRIME(97)
-                            default: process_p_dyn(p, magic, shift, start_j, W_block, rem.data());
+                            default: process_p_dyn(p, inv_p, limit, start_j, num_new, rem_ptr);
                         }
+                        #undef PROCESS_PRIME
                         prime_offsets[idx] = start_j;
                     }
                     else
                     {
-                        prime_offsets[idx] = start_j - W_block;
+                        prime_offsets[idx] = start_j - num_new;
                     }
                 }
 
-                uint32_t j = 0;
-                while (j + k < W_block)
+                uint32_t W_search = overlap + num_new;
+                while (j + k < W_search)
                 {
                     int i = k;
-                    // Check backwards from the end of the window
                     while (i >= 0 && rem[j + i] <= 1)
                     {
                         --i;
@@ -284,8 +318,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
 
                     if (i < 0)
                     {
-                        // Found a valid sequence of length k+1!
-                        uint64_t n = block_L + j + k;
+                        uint64_t n = block_L - overlap + j + k;
                         if (n > k && n < global_min_n.load(std::memory_order_relaxed))
                         {
                             if (exact_check(n, k))
@@ -294,16 +327,30 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                                 while (n < current && !global_min_n.compare_exchange_weak(current, n, std::memory_order_relaxed)) {}
                             }
                         }
-                        ++j; // Advance by 1 to catch overlapping valid sequences
+                        ++j;
                     }
                     else
                     {
-                        // THE SKIP: Jump entirely past the non-smooth number!
                         j += i + 1;
                     }
                 }
+
+                if (W_search >= k)
+                {
+                    for (uint32_t i = 0; i < k; ++i)
+                    {
+                        rem[i] = rem[W_search - k + i];
+                    }
+                    j -= (W_search - k);
+                    overlap = k;
+                }
+                else
+                {
+                    overlap = W_search;
+                }
             }
 
+            // Background checkpointing
             if (chunk_id > NUM_THREADS && chunk_id % 1000 == 0)
             {
                 uint64_t safe_L = start_L + (chunk_id - NUM_THREADS) * CHUNK_SIZE;
