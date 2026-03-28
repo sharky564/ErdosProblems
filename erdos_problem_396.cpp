@@ -18,7 +18,7 @@
 #include <barrier>
 #include <immintrin.h>
 
-const unsigned int NUM_THREADS = std::thread::hardware_concurrency(); // 8
+const unsigned int NUM_THREADS = std::thread::hardware_concurrency();
 const unsigned int NUM_SEQ = 4;
 
 struct alignas(16) PrimeData
@@ -150,36 +150,46 @@ bool exact_check(uint64_t n, uint64_t k)
     return true;
 }
 
-template<uint64_t p>
-inline void process_prime_p(uint64_t start_j, uint64_t W_block, uint64_t* rem, uint64_t k)
+template<uint32_t p>
+inline void process_prime_p(uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
-    for (uint64_t j = start_j; j < W_block; j += p)
+    uint32_t j = start_j;
+    for (; j < W_block; j += p)
     {
         uint64_t temp = rem[j] / p;
-        while (true)
+        if (temp % p == 0) [[unlikely]]
         {
-            if (temp % p != 0)
-                break;
             temp /= p;
+            while (temp % p == 0)
+                temp /= p;
         }
         rem[j] = temp;
     }
+    start_j = j - W_block;
 }
 
-inline void process_p_dyn(uint32_t p, uint64_t magic, uint8_t shift, uint64_t start_j, uint64_t W_block, uint64_t* rem)
+inline void process_p_dyn(uint32_t p, uint64_t magic, uint8_t shift, uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
-    for (uint64_t j = start_j; j < W_block; j += p)
+    uint32_t j = start_j;
+    for (; j < W_block; j += p)
     {
         uint64_t temp = (uint64_t)((((unsigned __int128)rem[j] * magic) >> 64) >> shift);
-        while (true)
+
+        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift);
+        if (temp - q * p == 0) [[unlikely]]
         {
-            uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift);
-            if (temp - q * p != 0)
-                break;
             temp = q;
+            while (true)
+            {
+                q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift);
+                if (temp - q * p != 0)
+                    break;
+                temp = q;
+            }
         }
         rem[j] = temp;
     }
+    start_j = j - W_block;
 }
 
 uint64_t solve(uint64_t k, uint64_t start_L)
@@ -192,6 +202,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
 
     auto worker = [&]() {
         alignas(32) std::vector<uint64_t> rem(BLOCK_SIZE);
+        std::vector<uint32_t> prime_offsets;
 
         while (true)
         {
@@ -206,41 +217,63 @@ uint64_t solve(uint64_t k, uint64_t start_L)
             auto it = std::upper_bound(primes.begin(), primes.end(), max_p,[](uint64_t val, const PrimeData& pd) { return val < pd.p; });
             size_t chunk_total_primes = std::distance(primes.begin(), it);
 
+            if (prime_offsets.size() < chunk_total_primes)
+                prime_offsets.resize(chunk_total_primes);
+
+            for (size_t idx = 1; idx < chunk_total_primes; ++idx)
+            {
+                uint32_t p = primes[idx].p;
+                uint64_t magic = primes[idx].magic;
+                uint8_t shift = primes[idx].shift;
+
+                uint64_t num = L_chunk + p - 1;
+                uint64_t start_c = (uint64_t)((((unsigned __int128)num * magic) >> 64) >> shift);
+                prime_offsets[idx] = (uint32_t)(start_c * p - L_chunk);
+            }
+
             for (uint64_t block_L = L_chunk; block_L <= R_chunk; block_L += BLOCK_SIZE)
             {
                 uint64_t block_R = std::min(R_chunk, block_L + BLOCK_SIZE - 1);
-                uint64_t W_block = block_R - block_L + 1;
+                uint32_t W_block = (uint32_t)(block_R - block_L + 1);
 
                 uint64_t x = block_L;
-                for (uint64_t j = 0; j < W_block; ++j, ++x) {
+                for (uint32_t j = 0; j < W_block; ++j, ++x) {
                     rem[j] = x >> std::countr_zero(x);
                 }
 
                 for (size_t idx = 1; idx < chunk_total_primes; ++idx)
                 {
                     uint32_t p = primes[idx].p;
-                    uint64_t magic = primes[idx].magic;
-                    uint8_t shift = primes[idx].shift;
+                    uint32_t start_j = prime_offsets[idx];
 
-                    uint64_t num = block_L + p - 1;
-                    uint64_t start_c = (uint64_t)((((unsigned __int128)num * magic) >> 64) >> shift);
-                    uint64_t start_j = start_c * p - block_L;
-                    if (start_j >= W_block) continue;
-
-#define PROCESS_PRIME(p_val) \
-    case p_val: process_prime_p<p_val>(start_j, W_block, rem.data(), k); break;
-
-                    switch (p)
+                    if (start_j < W_block)
                     {
-                        PROCESS_PRIME(3) PROCESS_PRIME(5) PROCESS_PRIME(7) PROCESS_PRIME(11)
-                        PROCESS_PRIME(13) PROCESS_PRIME(17) PROCESS_PRIME(19) PROCESS_PRIME(23)
-                        default:
-                            process_p_dyn(p, magic, shift, start_j, W_block, rem.data());
+                        uint64_t magic = primes[idx].magic;
+                        uint8_t shift = primes[idx].shift;
+
+                        #define PROCESS_PRIME(p_val) \
+                            case p_val: process_prime_p<p_val>(start_j, W_block, rem.data()); break;
+
+                        switch (p)
+                        {
+                            PROCESS_PRIME(3) PROCESS_PRIME(5) PROCESS_PRIME(7) PROCESS_PRIME(11)
+                            PROCESS_PRIME(13) PROCESS_PRIME(17) PROCESS_PRIME(19) PROCESS_PRIME(23)
+                            PROCESS_PRIME(29) PROCESS_PRIME(31) PROCESS_PRIME(37) PROCESS_PRIME(41)
+                            PROCESS_PRIME(43) PROCESS_PRIME(47) PROCESS_PRIME(53) PROCESS_PRIME(59)
+                            PROCESS_PRIME(61) PROCESS_PRIME(67) PROCESS_PRIME(71) PROCESS_PRIME(73)
+                            PROCESS_PRIME(79) PROCESS_PRIME(83) PROCESS_PRIME(89) PROCESS_PRIME(97)
+                            default: process_p_dyn(p, magic, shift, start_j, W_block, rem.data());
+                        }
+                        prime_offsets[idx] = start_j;
+                    }
+                    else
+                    {
+                        prime_offsets[idx] = start_j - W_block;
                     }
                 }
 
                 uint64_t consecutive = 0;
-                for (uint64_t j = 0; j < W_block; ++j)
+                for (uint32_t j = 0; j < W_block; ++j)
                 {
                     if (rem[j] <= 1)
                     {
