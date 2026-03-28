@@ -272,27 +272,34 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                     }
                 }
 
-                uint64_t consecutive = 0;
-                for (uint32_t j = 0; j < W_block; ++j)
+                uint32_t j = 0;
+                while (j + k < W_block)
                 {
-                    if (rem[j] <= 1)
+                    int i = k;
+                    // Check backwards from the end of the window
+                    while (i >= 0 && rem[j + i] <= 1)
                     {
-                        if (++consecutive >= k + 1)
+                        --i;
+                    }
+
+                    if (i < 0)
+                    {
+                        // Found a valid sequence of length k+1!
+                        uint64_t n = block_L + j + k;
+                        if (n > k && n < global_min_n.load(std::memory_order_relaxed))
                         {
-                            uint64_t n = block_L + j;
-                            if (n > k && n < global_min_n.load(std::memory_order_relaxed))
+                            if (exact_check(n, k))
                             {
-                                if (exact_check(n, k))
-                                {
-                                    uint64_t current = global_min_n.load(std::memory_order_relaxed);
-                                    while (n < current && !global_min_n.compare_exchange_weak(current, n, std::memory_order_relaxed)) {}
-                                }
+                                uint64_t current = global_min_n.load(std::memory_order_relaxed);
+                                while (n < current && !global_min_n.compare_exchange_weak(current, n, std::memory_order_relaxed)) {}
                             }
                         }
+                        ++j; // Advance by 1 to catch overlapping valid sequences
                     }
                     else
                     {
-                        consecutive = 0;
+                        // THE SKIP: Jump entirely past the non-smooth number!
+                        j += i + 1;
                     }
                 }
             }
