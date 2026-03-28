@@ -20,11 +20,17 @@
 
 const unsigned int NUM_THREADS = std::thread::hardware_concurrency(); // 8
 const unsigned int NUM_SEQ = 4;
-std::vector<uint64_t> primes;
-std::vector<uint64_t> prime_magics;
-std::vector<uint8_t> prime_shifts;
 
-void get_primes(uint64_t limit) 
+struct alignas(16) PrimeData 
+{
+    uint64_t magic;
+    uint32_t p;
+    uint8_t shift;
+};
+
+std::vector<PrimeData> primes;
+
+void get_primes(uint32_t limit) 
 {
     std::vector<bool> sieve(limit + 1, true);
     sieve[0] = false;
@@ -37,15 +43,13 @@ void get_primes(uint64_t limit)
                 sieve[i] = false;
         }
     }
-    for (uint64_t p = 2; p <= limit; ++p) 
+    for (uint32_t p = 2; p <= limit; ++p) 
     {
         if (sieve[p]) 
         {
-            primes.push_back(p);
             uint8_t shift = std::bit_width(p) - 1;
             unsigned __int128 magic_128 = ((unsigned __int128)1 << (64 + shift)) / p + 1;
-            prime_magics.push_back((uint64_t)magic_128);
-            prime_shifts.push_back(shift);
+            primes.push_back({(uint64_t)magic_128, p, shift});
         }
     }
 }
@@ -56,8 +60,9 @@ bool exact_check(uint64_t n, uint64_t k)
     if (std::popcount(n) < nu_2_prod) [[unlikely]]
         return false;
 
-    for (uint64_t p : primes) 
+    for (const auto& pd : primes) 
     {
+        uint64_t p = pd.p;
         if (p == 2)
             continue;
         if (p > 2 * k)
@@ -83,7 +88,15 @@ bool exact_check(uint64_t n, uint64_t k)
 }
 
 template<uint64_t p>
-inline void process_prime_p(uint64_t start_c, uint64_t start_j, uint64_t W_block, uint8_t* valid, uint64_t* rem, uint64_t k) {
+inline void process_prime_p(
+    uint64_t start_c, 
+    uint64_t start_j, 
+    uint64_t W_block, 
+    uint8_t* valid, 
+    uint64_t* rem, 
+    uint64_t k
+) 
+{
     if (p > 2 * k) 
     {
         uint64_t c = start_c;
@@ -155,7 +168,18 @@ inline void process_prime_p(uint64_t start_c, uint64_t start_j, uint64_t W_block
     }
 }
 
-inline void process_p_dyn(uint64_t p, uint64_t magic, uint8_t shift, uint64_t start_c, uint64_t start_j, uint64_t W_block, uint8_t* valid, uint64_t* rem, uint64_t k) {
+inline void process_p_dyn(
+    uint64_t p, 
+    uint64_t magic, 
+    uint8_t shift, 
+    uint64_t start_c, 
+    uint64_t start_j, 
+    uint64_t W_block, 
+    uint8_t* valid, 
+    uint64_t* rem, 
+    uint64_t k
+) 
+{
     if (p > 2 * k) 
     {
         uint64_t c = start_c;
@@ -174,8 +198,8 @@ inline void process_p_dyn(uint64_t p, uint64_t magic, uint8_t shift, uint64_t st
                     uint64_t temp = c;
                     while (temp > 0) 
                     {
-                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); // temp / p
-                        if (temp - q * p != 0) // temp % p != 0
+                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); 
+                        if (temp - q * p != 0) 
                             break;
                         ++nu;
                         temp = q;
@@ -184,8 +208,8 @@ inline void process_p_dyn(uint64_t p, uint64_t magic, uint8_t shift, uint64_t st
                     uint64_t carry = 0;
                     while (temp > 0) 
                     {
-                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); // temp / p
-                        uint64_t digit = temp - q * p; // temp % p
+                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); 
+                        uint64_t digit = temp - q * p; 
                         carry = (digit * 2 + carry >= p);
                         carries += carry;
                         if (carries > nu)
@@ -201,13 +225,13 @@ inline void process_p_dyn(uint64_t p, uint64_t magic, uint8_t shift, uint64_t st
                 } 
                 else 
                 {
-                    uint64_t temp = (uint64_t)((((unsigned __int128)rem[j] * magic) >> 64) >> shift); // temp / p
+                    uint64_t temp = (uint64_t)((((unsigned __int128)rem[j] * magic) >> 64) >> shift); 
                     if (temp > 0) 
                     {
                         while (true) 
                         {
-                            uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); // temp / p
-                            if (temp - q * p != 0) // temp % p != 0
+                            uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); 
+                            if (temp - q * p != 0) 
                                 break;
                             temp = q;
                         }
@@ -223,13 +247,13 @@ inline void process_p_dyn(uint64_t p, uint64_t magic, uint8_t shift, uint64_t st
         {
             if (valid[j]) 
             {
-                uint64_t temp = (uint64_t)((((unsigned __int128)rem[j] * magic) >> 64) >> shift); // temp / p
+                uint64_t temp = (uint64_t)((((unsigned __int128)rem[j] * magic) >> 64) >> shift); 
                 if (temp > 0) 
                 {
                     while (true) 
                     {
-                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); // temp / p
-                        if (temp - q * p != 0) // temp % p != 0
+                        uint64_t q = (uint64_t)((((unsigned __int128)temp * magic) >> 64) >> shift); 
+                        if (temp - q * p != 0) 
                             break;
                         temp = q;
                     }
@@ -290,6 +314,12 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                     continue;
 
                 uint64_t max_p = std::max<uint64_t>(std::sqrt(2 * R_chunk) + 1, 2 * k);
+                
+                auto it = std::upper_bound(primes.begin(), primes.end(), max_p,[](uint64_t val, const PrimeData& pd) {
+                        return val < pd.p;
+                    });
+                size_t chunk_total_primes = std::distance(primes.begin(), it);
+                
                 uint64_t consecutive = 0;
 
                 for (uint64_t block_L = L_chunk; block_L <= R_chunk; block_L += BLOCK_SIZE) 
@@ -304,16 +334,15 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                         rem[j] = x >> std::countr_zero(x);
                     }
 
-                    size_t total_primes = primes.size();
-                    for (size_t idx = 0; idx < total_primes; ++idx) 
+                    for (size_t idx = 1; idx < chunk_total_primes; ++idx) 
                     {
-                        uint64_t p = primes[idx];
-                        if (p == 2)
-                            continue;
-                        if (p > max_p)
-                            break;
+                        uint32_t p = primes[idx].p;
+                        uint64_t magic = primes[idx].magic;
+                        uint8_t shift = primes[idx].shift;
                         
-                        uint64_t start_c = (block_L + p - 1) / p;
+                        uint64_t num = block_L + p - 1;
+                        uint64_t start_c = (uint64_t)((((unsigned __int128)num * magic) >> 64) >> shift);
+                        
                         uint64_t start_j = start_c * p - block_L;
                         if (start_j >= W_block)
                             continue;
@@ -333,7 +362,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                             PROCESS_PRIME(181) PROCESS_PRIME(191) PROCESS_PRIME(193) PROCESS_PRIME(197)
                             PROCESS_PRIME(199)
                             default:
-                                process_p_dyn(p, prime_magics[idx], prime_shifts[idx], start_c, start_j, W_block, valid.data(), rem.data(), k);
+                                process_p_dyn(p, magic, shift, start_c, start_j, W_block, valid.data(), rem.data(), k);
                                 break;
                         }
                     }
@@ -342,7 +371,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                     
                     for (; j + 32 <= W_block; j += 32) 
                     {
-                        __m256i v = _mm256_load_si256((const __m256i*)(valid.data() + j));
+                        __m256i v = _mm256_loadu_si256((const __m256i*)(valid.data() + j));
                         uint32_t mask = _mm256_movemask_epi8(v);
                         
                         if (mask == 0) 
