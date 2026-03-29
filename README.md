@@ -7,27 +7,31 @@ Current performance:
 ```
 Detected 8 logical cores. Using C++ Thread Pool...
 Generating primes up to 200,000,000...
-Primes generated in 1.47169 seconds.
+Primes generated in 1.5962 seconds.
 
-n =  1 | min k =            1 | Time:   0.0000 s | Speed:     2.00 M candidates/s
-n =  2 | min k =            5 | Time:   5.9942 s | Speed:     0.00 M candidates/s
-n =  3 | min k =            4 | Time:   6.2366 s | Speed:     0.00 M candidates/s
-n =  4 | min k =          207 | Time:   6.2200 s | Speed:     0.00 M candidates/s
-n =  5 | min k =          206 | Time:   6.3315 s | Speed:     0.00 M candidates/s
-n =  6 | min k =         2475 | Time:   6.2493 s | Speed:     0.00 M candidates/s
-n =  7 | min k =          984 | Time:   6.2682 s | Speed:     0.00 M candidates/s
-n =  8 | min k =         8171 | Time:   6.2045 s | Speed:     0.00 M candidates/s
-n =  9 | min k =         8170 | Time:   6.2722 s | Speed:     0.00 M candidates/s
-n = 10 | min k =        45144 | Time:   6.1092 s | Speed:     0.01 M candidates/s
-n = 11 | min k =        45143 | Time:   6.2064 s | Speed:     0.01 M candidates/s
-n = 12 | min k =      3648830 | Time:   6.5104 s | Speed:     0.56 M candidates/s
-n = 13 | min k =      3648829 | Time:   6.5536 s | Speed:     0.56 M candidates/s
-n = 14 | min k =      7979077 | Time:   8.5048 s | Speed:     0.94 M candidates/s
-n = 15 | min k =      7979076 | Time:   8.6225 s | Speed:     0.93 M candidates/s
-n = 16 | min k =     58068862 | Time:  16.9073 s | Speed:     3.43 M candidates/s
-n = 17 | min k =     58068861 | Time:  17.0802 s | Speed:     3.40 M candidates/s
-n = 18 | min k =    255278295 | Time:  58.1312 s | Speed:     4.39 M candidates/s
-n = 19 | min k =    255278294 | Time:  58.7075 s | Speed:     4.35 M candidates/s
+n =  1 | min k =               1 | Time:       0.0000 s | Speed:     3.33 M candidates/s
+n =  2 | min k =               5 | Time:       0.0115 s | Speed:     0.00 M candidates/s
+n =  3 | min k =               4 | Time:       0.0150 s | Speed:     0.00 M candidates/s
+n =  4 | min k =             207 | Time:       0.0101 s | Speed:     0.02 M candidates/s
+n =  5 | min k =             206 | Time:       0.0093 s | Speed:     0.02 M candidates/s
+n =  6 | min k =            2475 | Time:       0.0089 s | Speed:     0.28 M candidates/s
+n =  7 | min k =             984 | Time:       0.0088 s | Speed:     0.11 M candidates/s
+n =  8 | min k =            8171 | Time:       0.0084 s | Speed:     0.97 M candidates/s
+n =  9 | min k =            8170 | Time:       0.0065 s | Speed:     1.25 M candidates/s
+n = 10 | min k =           45144 | Time:       0.0073 s | Speed:     6.15 M candidates/s
+n = 11 | min k =           45143 | Time:       0.0071 s | Speed:     6.35 M candidates/s
+n = 12 | min k =         3648830 | Time:       0.0094 s | Speed:   386.75 M candidates/s
+n = 13 | min k =         3648829 | Time:       0.0115 s | Speed:   317.71 M candidates/s
+n = 14 | min k =         7979077 | Time:       0.0163 s | Speed:   488.12 M candidates/s
+n = 15 | min k =         7979076 | Time:       0.0152 s | Speed:   525.36 M candidates/s
+n = 16 | min k =        58068862 | Time:       0.0437 s | Speed:  1329.41 M candidates/s
+n = 17 | min k =        58068861 | Time:       0.0464 s | Speed:  1250.61 M candidates/s
+n = 18 | min k =       255278295 | Time:       0.1824 s | Speed:  1399.71 M candidates/s
+n = 19 | min k =       255278294 | Time:       0.1970 s | Speed:  1295.72 M candidates/s
+n = 20 | min k =      1019547825 | Time:       0.6719 s | Speed:  1517.45 M candidates/s
+n = 21 | min k =      1019547824 | Time:       0.6754 s | Speed:  1509.44 M candidates/s
+n = 22 | min k =     17609764973 | Time:      14.8726 s | Speed:  1184.04 M candidates/s
+n = 23 | min k =     17609764972 | Time:      14.8410 s | Speed:  1186.56 M candidates/s
 ```
 
 
