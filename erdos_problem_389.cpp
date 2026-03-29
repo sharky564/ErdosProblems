@@ -342,7 +342,8 @@ uint64_t solve(uint64_t n, uint64_t start_L)
                 prime_offsets[idx] = (uint32_t)(start_c * p - L_chunk);
             }
 
-            for (int i = 0; i < 33; ++i) buckets[i].clear();
+            for (int i = 0; i < 33; ++i)
+                buckets[i].clear();
 
             for (size_t idx = first_large_prime_idx; idx < chunk_total_primes; ++idx)
             {
