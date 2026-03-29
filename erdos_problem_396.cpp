@@ -265,6 +265,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
     std::atomic<uint64_t> current_chunk{0};
     std::atomic<uint64_t> global_min_n{static_cast<uint64_t>(-1)};
 
+    auto start_time = std::chrono::high_resolution_clock::now();
     auto worker = [&]() {
         const uint32_t OPT_BLOCK_SIZE = 32768;
         const uint32_t BLOCK_SHIFT = 15;
@@ -306,11 +307,15 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 prime_offsets[idx] = (uint32_t)(start_c * p - L_chunk);
             }
 
-            for (int i = 0; i < 33; ++i) buckets[i].clear();
+            for (int i = 0; i < 33; ++i)
+                buckets[i].clear();
 
             for (size_t idx = first_large_prime_idx; idx < chunk_total_primes; ++idx)
             {
                 uint64_t start_j = prime_offsets[idx];
+                if (start_j >= CHUNK_W)
+                    continue;
+
                 uint32_t p = primes[idx].p;
                 while (start_j < CHUNK_W)
                 {
@@ -450,6 +455,15 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                         fout.close();
                         std::error_code ec;
                         std::filesystem::rename("checkpoint-396.tmp", "checkpoint-396.txt", ec);
+
+                        auto current_time = std::chrono::high_resolution_clock::now();
+                        std::chrono::duration<double> elapsed = current_time - start_time;
+                        double speed = (safe_L - start_L) / elapsed.count();
+
+                        std::cout << "\r[Checkpoint] k = " << std::setw(2) << k
+                                  << " | Candidate L = " << safe_L
+                                  << " | Speed: " << std::fixed << std::setprecision(2) << (speed / 1e6) << " M candidates/s   "
+                                  << std::flush;
                     }
                     is_writing.store(false, std::memory_order_release);
                 }
@@ -506,7 +520,7 @@ int main()
         double speed = candidates_checked / seconds;
 
         std::ostringstream oss;
-        oss << "k = " << std::setw(2) << k
+        oss << "\nk = " << std::setw(2) << k
             << " | min n = " << std::setw(15) << ans
             << " | Time: " << std::fixed << std::setprecision(4) << std::setw(12) << seconds << " s"
             << " | Speed: " << std::fixed << std::setprecision(2) << std::setw(8) << (speed / 1e6) << " M candidates/s\n";
