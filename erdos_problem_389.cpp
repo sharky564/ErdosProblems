@@ -560,7 +560,8 @@ int main()
         std::string output_str = oss.str();
         std::cout << output_str;
         std::ofstream results_file("results-389.txt", std::ios::app);
-        if (results_file) results_file << output_str;
+        if (results_file)
+            results_file << output_str;
 
         start_L = 1;
         std::ofstream fout("checkpoint-389.tmp");
