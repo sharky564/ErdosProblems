@@ -65,6 +65,11 @@ struct FastBucket
     }
 };
 
+struct alignas(64) AlignedAtomic
+{
+    std::atomic<uint64_t> val{UINT64_MAX};
+};
+
 std::vector<PrimeData> primes;
 
 void get_primes(uint32_t limit)
@@ -291,10 +296,11 @@ uint64_t solve(uint64_t n, uint64_t start_L)
     const uint64_t CHUNK_SIZE = 1048576;
     std::atomic<uint64_t> current_chunk{0};
     std::atomic<uint64_t> global_min_N{static_cast<uint64_t>(-1)};
+    std::vector<AlignedAtomic> active_chunks(NUM_THREADS);
     uint64_t base_L = start_L + m - K;
 
     auto start_time = std::chrono::high_resolution_clock::now();
-    auto worker = [&]() {
+    auto worker = [&](uint32_t thread_index) {
         const uint32_t OPT_BLOCK_SIZE = 32768;
         const uint32_t BLOCK_SHIFT = 15;
         const uint32_t BLOCK_MASK = 32767;
@@ -307,11 +313,15 @@ uint64_t solve(uint64_t n, uint64_t start_L)
         while (true)
         {
             uint64_t chunk_id = current_chunk.fetch_add(1, std::memory_order_relaxed);
+            active_chunks[thread_index].val.store(chunk_id, std::memory_order_release);
             uint64_t L_chunk = base_L + chunk_id * CHUNK_SIZE;
             uint64_t R_chunk = L_chunk + CHUNK_SIZE + K - 1;
 
             if (L_chunk + K > global_min_N.load(std::memory_order_relaxed))
+            {
+                active_chunks[thread_index].val.store(UINT64_MAX, std::memory_order_release);
                 break;
+            }
 
             uint32_t CHUNK_W = (uint32_t)(R_chunk - L_chunk + 1);
             uint64_t max_p = std::max<uint64_t>(std::sqrt(2 * R_chunk) + 1, m);
@@ -480,23 +490,28 @@ uint64_t solve(uint64_t n, uint64_t start_L)
                 bool expected = false;
                 if (is_writing.compare_exchange_strong(expected, true))
                 {
-                    uint64_t safe_k = start_L + (chunk_id - NUM_THREADS) * CHUNK_SIZE;
+                    uint64_t min_active = chunk_id;
+                    for (uint32_t t = 0; t < NUM_THREADS; ++t)
+                        min_active = std::min(min_active, active_chunks[t].val.load(std::memory_order_acquire));
+
+                    uint64_t safe_L = base_L + (min_active * CHUNK_SIZE);
+
                     std::ofstream fout("checkpoint-389.tmp");
                     if (fout)
                     {
-                        fout << n << " " << safe_k << "\n";
+                        fout << n << " " << safe_L << "\n";
                         fout.close();
                         std::error_code ec;
                         std::filesystem::rename("checkpoint-389.tmp", "checkpoint-389.txt", ec);
 
                         auto current_time = std::chrono::high_resolution_clock::now();
                         std::chrono::duration<double> elapsed = current_time - start_time;
-                        double speed = (safe_k - start_L) / elapsed.count();
+                        double speed = (safe_L - start_L) / elapsed.count();
 
                         std::cout << "\r[Checkpoint] n = " << std::setw(2) << n
-                                  << " | Candidate k = " << safe_k
-                                  << " | Speed: " << std::fixed << std::setprecision(2) << (speed / 1e6) << " M candidates/s   "
-                                  << std::flush;
+                                << " | Candidate k = " << safe_L
+                                << " | Speed: " << std::fixed << std::setprecision(2) << (speed / 1e6) << " M candidates/s   "
+                                << std::flush;
                     }
                     is_writing.store(false, std::memory_order_release);
                 }
@@ -506,7 +521,7 @@ uint64_t solve(uint64_t n, uint64_t start_L)
 
     std::vector<std::thread> threads;
     for (unsigned int i = 0; i < NUM_THREADS; ++i)
-        threads.emplace_back(worker);
+        threads.emplace_back(worker, i);
     for (auto& t : threads)
         t.join();
 

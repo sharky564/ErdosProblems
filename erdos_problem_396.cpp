@@ -65,6 +65,11 @@ struct FastBucket
     }
 };
 
+struct alignas(64) AlignedAtomic
+{
+    std::atomic<uint64_t> val{UINT64_MAX};
+};
+
 std::vector<PrimeData> primes;
 
 void get_primes(uint32_t limit)
@@ -264,9 +269,10 @@ uint64_t solve(uint64_t k, uint64_t start_L)
     const uint64_t CHUNK_SIZE = 1048576;
     std::atomic<uint64_t> current_chunk{0};
     std::atomic<uint64_t> global_min_n{static_cast<uint64_t>(-1)};
+    std::vector<AlignedAtomic> active_chunks(NUM_THREADS);
 
     auto start_time = std::chrono::high_resolution_clock::now();
-    auto worker = [&]() {
+    auto worker = [&](uint32_t thread_index) {
         const uint32_t OPT_BLOCK_SIZE = 32768;
         const uint32_t BLOCK_SHIFT = 15;
         const uint32_t BLOCK_MASK = 32767;
@@ -279,11 +285,16 @@ uint64_t solve(uint64_t k, uint64_t start_L)
         while (true)
         {
             uint64_t chunk_id = current_chunk.fetch_add(1, std::memory_order_relaxed);
+            active_chunks[thread_index].val.store(chunk_id, std::memory_order_release);
+
             uint64_t L_chunk = start_L + chunk_id * CHUNK_SIZE;
             uint64_t R_chunk = L_chunk + CHUNK_SIZE + k - 1;
 
             if (L_chunk > global_min_n.load(std::memory_order_relaxed))
+            {
+                active_chunks[thread_index].val.store(UINT64_MAX, std::memory_order_release);
                 break;
+            }
 
             uint32_t CHUNK_W = (uint32_t)(R_chunk - L_chunk + 1);
             uint64_t max_p = std::max<uint64_t>(std::sqrt(2 * R_chunk) + 1, 2 * k);
@@ -447,7 +458,11 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 bool expected = false;
                 if (is_writing.compare_exchange_strong(expected, true))
                 {
-                    uint64_t safe_L = start_L + (chunk_id - NUM_THREADS) * CHUNK_SIZE;
+                    uint64_t min_active = chunk_id;
+                    for (uint32_t t = 0; t < NUM_THREADS; ++t)
+                        min_active = std::min(min_active, active_chunks[t].val.load(std::memory_order_acquire));
+
+                    uint64_t safe_L = start_L + min_active * CHUNK_SIZE;
                     std::ofstream fout("checkpoint-396.tmp");
                     if (fout)
                     {
@@ -473,7 +488,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
 
     std::vector<std::thread> threads;
     for (unsigned int i = 0; i < NUM_THREADS; ++i)
-        threads.emplace_back(worker);
+        threads.emplace_back(worker, i);
     for (auto& t : threads)
         t.join();
 
