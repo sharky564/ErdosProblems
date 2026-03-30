@@ -32,6 +32,8 @@ n = 20 | min k =      1019547825 | Time:       0.6719 s | Speed:  1517.45 M cand
 n = 21 | min k =      1019547824 | Time:       0.6754 s | Speed:  1509.44 M candidates/s
 n = 22 | min k =     17609764973 | Time:      14.8726 s | Speed:  1184.04 M candidates/s
 n = 23 | min k =     17609764972 | Time:      14.8410 s | Speed:  1186.56 M candidates/s
+n = 24 | min k =   1070858041562 | Time:    1374.6043 s | Speed:   779.03 M candidates/s
+n = 25 | min k =   1070858041561 | Time:    1505.2951 s | Speed:   711.39 M candidates/s
 ```
 
 
