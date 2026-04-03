@@ -26,6 +26,12 @@ struct PrimeData
     uint8_t shift;
 };
 
+struct PrimeFast
+{
+    uint64_t inv_p;
+    uint64_t limit;
+};
+
 struct BucketItem
 {
     uint32_t p_idx;
@@ -71,6 +77,8 @@ struct alignas(64) AlignedAtomic
 };
 
 std::vector<PrimeData> primes;
+std::vector<PrimeFast> primes_fast;
+
 
 void get_primes(uint32_t limit)
 {
@@ -100,13 +108,15 @@ void get_primes(uint32_t limit)
                     inv *= 2 - p * inv;
             }
             primes.push_back({(uint64_t)magic_128, inv, UINT64_MAX / p, p, shift});
+            primes_fast.push_back({inv, UINT64_MAX / p});
         }
     }
 }
 
-bool exact_check(uint64_t n, uint64_t k)
+template <uint64_t K>
+bool exact_check(uint64_t n)
 {
-    uint32_t nu_2_prod = std::popcount(n - k - 1) - std::popcount(n) + k + 1;
+    uint32_t nu_2_prod = std::popcount(n - K - 1) - std::popcount(n) + K + 1;
     if (std::popcount(n) < nu_2_prod) [[unlikely]]
         return false;
 
@@ -115,14 +125,14 @@ bool exact_check(uint64_t n, uint64_t k)
         uint32_t p = pd.p;
         if (p == 2)
             continue;
-        if (p > 2 * k)
+        if (p > 2 * K)
             break;
 
         uint64_t nu_prod = 0, nu_comb = 0, power = p;
         while (true)
         {
             uint64_t v_n = n / power;
-            nu_prod += v_n - (n - k - 1) / power;
+            nu_prod += v_n - (n - K - 1) / power;
             nu_comb += (2 * n) / power - 2 * v_n;
             if (power > (2 * n) / p)
                 break;
@@ -132,7 +142,7 @@ bool exact_check(uint64_t n, uint64_t k)
             return false;
     }
 
-    for (uint64_t i = 0; i <= k; ++i)
+    for (uint64_t i = 0; i <= K; ++i)
     {
         uint64_t temp = n - i;
         temp >>= std::countr_zero(temp);
@@ -142,7 +152,7 @@ bool exact_check(uint64_t n, uint64_t k)
             if (p == 2)
                 continue;
 
-            if (p <= 2 * k)
+            if (p <= 2 * K)
             {
                 uint64_t q = temp * pd.inv_p;
                 while (q <= pd.limit)
@@ -154,7 +164,7 @@ bool exact_check(uint64_t n, uint64_t k)
             }
             if (p * p > temp)
             {
-                if (temp > 2 * k)
+                if (temp > 2 * K)
                 {
                     uint64_t p_val = temp;
                     uint64_t nu_prod = 1;
@@ -241,6 +251,7 @@ inline void process_prime_p(uint32_t& start_j, uint32_t W_block, uint64_t* rem)
     start_j = j - W_block;
 }
 
+
 inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
     uint32_t j = start_j;
@@ -264,7 +275,8 @@ inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t& 
     start_j = j - W_block;
 }
 
-uint64_t solve(uint64_t k, uint64_t start_L)
+template <uint64_t K>
+uint64_t solve_impl(uint64_t start_L)
 {
     const uint64_t CHUNK_SIZE = 1048576;
     std::atomic<uint64_t> current_chunk{0};
@@ -288,7 +300,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
             active_chunks[thread_index].val.store(chunk_id, std::memory_order_release);
 
             uint64_t L_chunk = start_L + chunk_id * CHUNK_SIZE;
-            uint64_t R_chunk = L_chunk + CHUNK_SIZE + k - 1;
+            uint64_t R_chunk = L_chunk + CHUNK_SIZE + K - 1;
 
             if (L_chunk > global_min_n.load(std::memory_order_relaxed))
             {
@@ -297,15 +309,13 @@ uint64_t solve(uint64_t k, uint64_t start_L)
             }
 
             uint32_t CHUNK_W = (uint32_t)(R_chunk - L_chunk + 1);
-            uint64_t max_p = std::max<uint64_t>(std::sqrt(2 * R_chunk) + 1, 2 * k);
+            uint64_t max_p = std::max<uint64_t>(std::sqrt(2 * R_chunk) + 1, 2 * K);
+
             auto it = std::upper_bound(primes.begin(), primes.end(), max_p,[](uint64_t val, const PrimeData& pd) { return val < pd.p; });
             size_t chunk_total_primes = std::distance(primes.begin(), it);
 
             if (prime_offsets.size() < chunk_total_primes)
                 prime_offsets.resize(chunk_total_primes);
-
-            auto it_large = std::upper_bound(primes.begin(), primes.begin() + chunk_total_primes, OPT_BLOCK_SIZE,[](uint32_t val, const PrimeData& pd) { return val < pd.p; });
-            size_t first_large_prime_idx = std::distance(primes.begin(), it_large);
 
             for (size_t idx = 1; idx < chunk_total_primes; ++idx)
             {
@@ -318,19 +328,20 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 prime_offsets[idx] = (uint32_t)(start_c * p - L_chunk);
             }
 
+            auto it_large = std::upper_bound(primes.begin(), primes.begin() + chunk_total_primes, OPT_BLOCK_SIZE, [](uint32_t val, const PrimeData& pd) { return val < pd.p; });
+            size_t first_large_prime_idx = std::distance(primes.begin(), it_large);
+
+
             for (int i = 0; i < 33; ++i)
                 buckets[i].clear();
 
             for (size_t idx = first_large_prime_idx; idx < chunk_total_primes; ++idx)
             {
-                uint64_t start_j = prime_offsets[idx];
-                if (start_j >= CHUNK_W)
-                    continue;
-
+                uint32_t start_j = prime_offsets[idx];
                 uint32_t p = primes[idx].p;
                 while (start_j < CHUNK_W)
                 {
-                    buckets[start_j >> BLOCK_SHIFT].push_back((uint32_t)idx, (uint32_t)(start_j & BLOCK_MASK));
+                    buckets[start_j >> BLOCK_SHIFT].push_back((uint32_t)idx, start_j & BLOCK_MASK);
                     start_j += p;
                 }
             }
@@ -388,14 +399,14 @@ uint64_t solve(uint64_t k, uint64_t start_L)
 
                 for (uint32_t i = 0; i < b_count; ++i)
                 {
-                    if (i + 8 < b_count) [[likely]]
-                        __builtin_prefetch(&primes[b_items[i + 8].p_idx], 0, 1);
+                    if (i + 24 < b_count) [[likely]]
+                        __builtin_prefetch(&primes_fast[b_items[i + 24].p_idx], 0, 1);
 
                     uint32_t p_idx = b_items[i].p_idx;
                     uint32_t offset = b_items[i].offset;
 
-                    uint64_t inv_p = primes[p_idx].inv_p;
-                    uint64_t limit = primes[p_idx].limit;
+                    uint64_t inv_p = primes_fast[p_idx].inv_p;
+                    uint64_t limit = primes_fast[p_idx].limit;
 
                     uint64_t temp = rem_ptr[offset] * inv_p;
                     uint64_t q = temp * inv_p;
@@ -414,37 +425,44 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                 }
 
                 uint32_t W_search = overlap + num_new;
-                while (j + k < W_search)
+                while (j + K < W_search)
                 {
-                    int i = k;
-                    while (i >= 0 && rem[j + i] <= 1)
-                        --i;
-
-                    if (i < 0)
+                    if (rem[j + K] != 1) [[likely]]
                     {
-                        uint64_t n = block_L - overlap + j + k;
-                        if (n > k && n < global_min_n.load(std::memory_order_relaxed))
-                        {
-                            if (exact_check(n, k))
-                            {
-                                uint64_t current = global_min_n.load(std::memory_order_relaxed);
-                                while (n < current && !global_min_n.compare_exchange_weak(current, n, std::memory_order_relaxed)) {}
-                            }
-                        }
-                        ++j;
+                        j += K + 1;
                     }
                     else
                     {
-                        j += i + 1;
+                        int i = K - 1;
+                        while (i >= 0 && rem[j + i] == 1)
+                            --i;
+
+                        if (i < 0)
+                        {
+                            uint64_t n = block_L - overlap + j + K;
+                            if (n > K && n < global_min_n.load(std::memory_order_relaxed))
+                            {
+                                if (exact_check<K>(n))
+                                {
+                                    uint64_t current = global_min_n.load(std::memory_order_relaxed);
+                                    while (n < current && !global_min_n.compare_exchange_weak(current, n, std::memory_order_relaxed)) {}
+                                }
+                            }
+                            ++j;
+                        }
+                        else
+                        {
+                            j += i + 1;
+                        }
                     }
                 }
 
-                if (W_search >= k)
+                if (W_search >= K)
                 {
-                    for (uint32_t i = 0; i < k; ++i)
-                        rem[i] = rem[W_search - k + i];
-                    j -= (W_search - k);
-                    overlap = k;
+                    for (uint32_t i = 0; i < K; ++i)
+                        rem[i] = rem[W_search - K + i];
+                    j -= (W_search - K);
+                    overlap = K;
                 }
                 else
                 {
@@ -466,7 +484,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                     std::ofstream fout("checkpoint-396.tmp");
                     if (fout)
                     {
-                        fout << k << " " << safe_L << "\n";
+                        fout << K << " " << safe_L << "\n";
                         fout.close();
                         std::error_code ec;
                         std::filesystem::rename("checkpoint-396.tmp", "checkpoint-396.txt", ec);
@@ -475,7 +493,7 @@ uint64_t solve(uint64_t k, uint64_t start_L)
                         std::chrono::duration<double> elapsed = current_time - start_time;
                         double speed = (safe_L - start_L) / elapsed.count();
 
-                        std::cout << "\r[Checkpoint] k = " << std::setw(2) << k
+                        std::cout << "\r[Checkpoint] k = " << std::setw(2) << K
                                   << " | Candidate L = " << safe_L
                                   << " | Speed: " << std::fixed << std::setprecision(2) << (speed / 1e6) << " M candidates/s   "
                                   << std::flush;
@@ -493,6 +511,34 @@ uint64_t solve(uint64_t k, uint64_t start_L)
         t.join();
 
     return global_min_n.load();
+}
+
+uint64_t solve(uint64_t k, uint64_t start_L)
+{
+    switch (k)
+    {
+        case  1: return solve_impl<1>(start_L);
+        case  2: return solve_impl<2>(start_L);
+        case  3: return solve_impl<3>(start_L);
+        case  4: return solve_impl<4>(start_L);
+        case  5: return solve_impl<5>(start_L);
+        case  6: return solve_impl<6>(start_L);
+        case  7: return solve_impl<7>(start_L);
+        case  8: return solve_impl<8>(start_L);
+        case  9: return solve_impl<9>(start_L);
+        case 10: return solve_impl<10>(start_L);
+        case 11: return solve_impl<11>(start_L);
+        case 12: return solve_impl<12>(start_L);
+        case 13: return solve_impl<13>(start_L);
+        case 14: return solve_impl<14>(start_L);
+        case 15: return solve_impl<15>(start_L);
+        case 16: return solve_impl<16>(start_L);
+        case 17: return solve_impl<17>(start_L);
+        case 18: return solve_impl<18>(start_L);
+        case 19: return solve_impl<19>(start_L);
+        case 20: return solve_impl<20>(start_L);
+        default: return 0;
+    }
 }
 
 int main()
@@ -535,7 +581,7 @@ int main()
         double speed = candidates_checked / seconds;
 
         std::ostringstream oss;
-        oss << "\nk = " << std::setw(2) << k
+        oss << "\rk = " << std::setw(2) << k
             << " | min n = " << std::setw(15) << ans
             << " | Time: " << std::fixed << std::setprecision(4) << std::setw(12) << seconds << " s"
             << " | Speed: " << std::fixed << std::setprecision(2) << std::setw(8) << (speed / 1e6) << " M candidates/s\n";
