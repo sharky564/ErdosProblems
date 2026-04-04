@@ -222,110 +222,49 @@ bool exact_check(uint64_t n)
 template<uint32_t p>
 inline void process_prime_p(uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
-    constexpr uint64_t inv_p1 =[]() {
+    constexpr uint64_t inv_p =[]() {
         uint64_t inv = p;
         for (int i = 0; i < 5; ++i)
             inv *= 2 - p * inv;
         return inv;
     }();
-    constexpr uint64_t limit_p1 = UINT64_MAX / p;
+    constexpr uint64_t inv_p2 = inv_p * inv_p;
+    constexpr uint64_t limit = UINT64_MAX / p;
 
-    if constexpr (p == 3)
+    uint32_t j = start_j;
+    for (; j < W_block; j += p)
     {
-        constexpr uint64_t p2 = (uint64_t)p * p;
-        constexpr uint64_t p4 = p2 * p2;
-        constexpr uint64_t inv_p2 = inv_p1 * inv_p1;
-        constexpr uint64_t inv_p4 = inv_p2 * inv_p2;
-        constexpr uint64_t limit_p2 = UINT64_MAX / p2;
-        constexpr uint64_t limit_p4 = UINT64_MAX / p4;
+        uint64_t val = rem[j];
+        uint64_t temp = val * inv_p;
+        uint64_t q = val * inv_p2;
 
-        uint32_t j = start_j;
-        for (; j < W_block; j += p)
+        if (q <= limit) [[unlikely]]
         {
-            uint64_t temp = rem[j] * inv_p1;
-            uint64_t q = temp * inv_p4;
-            if (q <= limit_p4) [[unlikely]]
+            temp = q;
+            while (true)
             {
+                q = temp * inv_p;
+                if (q > limit)
+                    break;
                 temp = q;
-                while (true)
-                {
-                    q = temp * inv_p4;
-                    if (q > limit_p4)
-                        break;
-                    temp = q;
-                }
             }
-            q = temp * inv_p2;
-            if (q <= limit_p2)
-                temp = q;
-            q = temp * inv_p1;
-            if (q <= limit_p1)
-                temp = q;
-            rem[j] = temp;
         }
-        start_j = j - W_block;
+        rem[j] = temp;
     }
-    else if constexpr (p <= 17)
-    {
-        constexpr uint64_t p2 = (uint64_t)p * p;
-        constexpr uint64_t inv_p2 = inv_p1 * inv_p1;
-        constexpr uint64_t limit_p2 = UINT64_MAX / p2;
-        uint32_t j = start_j;
-        for (; j < W_block; j += p)
-        {
-            uint64_t temp = rem[j] * inv_p1;
-            uint64_t q = temp * inv_p2;
-            if (q <= limit_p2) [[unlikely]]
-            {
-                temp = q;
-                while (true)
-                {
-                    q = temp * inv_p2;
-                    if (q > limit_p2)
-                        break;
-                    temp = q;
-                }
-            }
-
-            q = temp * inv_p1;
-            if (q <= limit_p1)
-                temp = q;
-            rem[j] = temp;
-        }
-        start_j = j - W_block;
-    }
-    else
-    {
-        uint32_t j = start_j;
-        for (; j < W_block; j += p)
-        {
-            uint64_t temp = rem[j] * inv_p1;
-            uint64_t q = temp * inv_p1;
-            if (q <= limit_p1) [[unlikely]]
-            {
-                temp = q;
-                while (true)
-                {
-                    q = temp * inv_p1;
-                    if (q > limit_p1)
-                        break;
-                    temp = q;
-                }
-            }
-            rem[j] = temp;
-        }
-        start_j = j - W_block;
-    }
+    start_j = j - W_block;
 }
 
 
 inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
+    const uint64_t inv_p2 = inv_p * inv_p;
     uint32_t j = start_j;
     for (; j < W_block; j += p)
     {
-        uint64_t temp = rem[j] * inv_p;
-        uint64_t q = temp * inv_p;
+        uint64_t val = rem[j];
+        uint64_t temp = val * inv_p;
+        uint64_t q = val * inv_p2;
+
         if (q <= limit) [[unlikely]]
         {
             temp = q;
@@ -474,9 +413,12 @@ uint64_t solve_impl(uint64_t start_L)
 
                     uint64_t inv_p = primes_fast[p_idx].inv_p;
                     uint64_t limit = primes_fast[p_idx].limit;
+                    uint64_t inv_p2 = inv_p * inv_p;
 
-                    uint64_t temp = rem_ptr[offset] * inv_p;
-                    uint64_t q = temp * inv_p;
+                    uint64_t val = rem_ptr[offset];
+                    uint64_t temp = val * inv_p;
+                    uint64_t q = val * inv_p2;
+
                     if (q <= limit) [[unlikely]]
                     {
                         temp = q;
