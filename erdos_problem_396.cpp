@@ -43,8 +43,8 @@ struct FastBucket
 
     FastBucket()
     {
-        cap = 16384;
-        data = static_cast<BucketItem*>(std::malloc(cap * sizeof(BucketItem)));
+        cap = 0;
+        data = nullptr;
         count = 0;
     }
 
@@ -55,13 +55,17 @@ struct FastBucket
 
     inline void clear() { count = 0; }
 
-    inline void push_back(uint32_t p_idx, uint32_t offset)
+    void reserve(uint32_t new_cap)
     {
-        if (count == cap) [[unlikely]]
+        if (new_cap > cap) [[unlikely]]
         {
-            cap *= 2;
+            cap = new_cap;
             data = static_cast<BucketItem*>(std::realloc(data, cap * sizeof(BucketItem)));
         }
+    }
+
+    inline void push_back_unsafe(uint32_t p_idx, uint32_t offset)
+    {
         data[count].p_idx = p_idx;
         data[count].offset = offset;
         ++count;
@@ -303,10 +307,13 @@ uint64_t solve_impl(uint64_t start_L)
 
             auto it_large = std::upper_bound(primes.begin(), primes.begin() + chunk_total_primes, OPT_BLOCK_SIZE, [](uint32_t val, const PrimeData& pd) { return val < pd.p; });
             size_t first_large_prime_idx = std::distance(primes.begin(), it_large);
-
+            uint32_t safe_cap = (uint32_t)(chunk_total_primes - first_large_prime_idx);
 
             for (int i = 0; i < FAST_BUCKET_SIZE; ++i)
+            {
+                buckets[i].reserve(safe_cap);
                 buckets[i].clear();
+            }
 
             for (size_t idx = first_large_prime_idx; idx < chunk_total_primes; ++idx)
             {
@@ -314,7 +321,7 @@ uint64_t solve_impl(uint64_t start_L)
                 uint32_t p = primes[idx].p;
                 while (start_j < CHUNK_W)
                 {
-                    buckets[start_j >> BLOCK_SHIFT].push_back((uint32_t)idx, start_j & BLOCK_MASK);
+                    buckets[start_j >> BLOCK_SHIFT].push_back_unsafe((uint32_t)idx, start_j & BLOCK_MASK);
                     start_j += p;
                 }
             }
