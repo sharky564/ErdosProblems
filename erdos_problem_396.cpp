@@ -1,6 +1,3 @@
-#pragma GCC optimize("O3,unroll-loops")
-#pragma GCC target("avx2,bmi,bmi2,lzcnt,popcnt")
-
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -219,52 +216,15 @@ bool exact_check(uint64_t n)
     return true;
 }
 
-template<uint32_t p>
-inline void process_prime_p(uint32_t& start_j, uint32_t W_block, uint64_t* rem)
-{
-    constexpr uint64_t inv_p =[]() {
-        uint64_t inv = p;
-        for (int i = 0; i < 5; ++i)
-            inv *= 2 - p * inv;
-        return inv;
-    }();
-    constexpr uint64_t inv_p2 = inv_p * inv_p;
-    constexpr uint64_t limit = UINT64_MAX / p;
-
-    uint32_t j = start_j;
-    for (; j < W_block; j += p)
-    {
-        uint64_t val = rem[j];
-        uint64_t temp = val * inv_p;
-        uint64_t q = val * inv_p2;
-
-        if (q <= limit) [[unlikely]]
-        {
-            temp = q;
-            while (true)
-            {
-                q = temp * inv_p;
-                if (q > limit)
-                    break;
-                temp = q;
-            }
-        }
-        rem[j] = temp;
-    }
-    start_j = j - W_block;
-}
-
 
 inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
-    const uint64_t inv_p2 = inv_p * inv_p;
     uint32_t j = start_j;
     for (; j < W_block; j += p)
     {
         uint64_t val = rem[j];
         uint64_t temp = val * inv_p;
-        uint64_t q = val * inv_p2;
-
+        uint64_t q = temp * inv_p;
         if (q <= limit) [[unlikely]]
         {
             temp = q;
@@ -292,19 +252,26 @@ uint64_t solve_impl(uint64_t start_L)
     auto start_time = std::chrono::high_resolution_clock::now();
     auto worker = [&](uint32_t thread_index) {
         const uint32_t OPT_BLOCK_SIZE = 32768;
-        const uint32_t BLOCK_SHIFT = 15;
-        const uint32_t BLOCK_MASK = 32767;
+        const uint32_t BLOCK_SHIFT = std::countr_zero(OPT_BLOCK_SIZE);
+        const uint32_t BLOCK_MASK = OPT_BLOCK_SIZE - 1;
+        const uint32_t FAST_BUCKET_SIZE = CHUNK_SIZE / OPT_BLOCK_SIZE + 1;
 
         std::vector<uint64_t> rem(OPT_BLOCK_SIZE + 32);
         std::vector<uint32_t> prime_offsets;
 
-        FastBucket buckets[33];
+        FastBucket buckets[FAST_BUCKET_SIZE];
 
         while (true)
         {
             uint64_t chunk_id = current_chunk.fetch_add(1, std::memory_order_relaxed);
             active_chunks[thread_index].val.store(chunk_id, std::memory_order_release);
-
+#ifdef BENCHMARK
+            if (chunk_id >= 10000ULL)
+            {
+                active_chunks[thread_index].val.store(UINT64_MAX, std::memory_order_release);
+                break;
+            }
+#endif
             uint64_t L_chunk = start_L + chunk_id * CHUNK_SIZE;
             uint64_t R_chunk = L_chunk + CHUNK_SIZE + K - 1;
 
@@ -338,7 +305,7 @@ uint64_t solve_impl(uint64_t start_L)
             size_t first_large_prime_idx = std::distance(primes.begin(), it_large);
 
 
-            for (int i = 0; i < 33; ++i)
+            for (int i = 0; i < FAST_BUCKET_SIZE; ++i)
                 buckets[i].clear();
 
             for (size_t idx = first_large_prime_idx; idx < chunk_total_primes; ++idx)
@@ -375,23 +342,7 @@ uint64_t solve_impl(uint64_t start_L)
 
                     if (start_j < num_new)
                     {
-                        uint64_t inv_p = primes[idx].inv_p;
-                        uint64_t limit = primes[idx].limit;
-
-                        #define PROCESS_PRIME(p_val) \
-                            case p_val: process_prime_p<p_val>(start_j, num_new, rem_ptr); break;
-
-                        switch (p)
-                        {
-                            PROCESS_PRIME(3) PROCESS_PRIME(5) PROCESS_PRIME(7) PROCESS_PRIME(11)
-                            PROCESS_PRIME(13) PROCESS_PRIME(17) PROCESS_PRIME(19) PROCESS_PRIME(23)
-                            PROCESS_PRIME(29) PROCESS_PRIME(31) PROCESS_PRIME(37) PROCESS_PRIME(41)
-                            PROCESS_PRIME(43) PROCESS_PRIME(47) PROCESS_PRIME(53) PROCESS_PRIME(59)
-                            PROCESS_PRIME(61) PROCESS_PRIME(67) PROCESS_PRIME(71) PROCESS_PRIME(73)
-                            PROCESS_PRIME(79) PROCESS_PRIME(83) PROCESS_PRIME(89) PROCESS_PRIME(97)
-                            default: process_p_dyn(p, inv_p, limit, start_j, num_new, rem_ptr);
-                        }
-                        #undef PROCESS_PRIME
+                        process_p_dyn(p, primes[idx].inv_p, primes[idx].limit, start_j, num_new, rem_ptr);
                         prime_offsets[idx] = start_j;
                     }
                     else
@@ -405,19 +356,18 @@ uint64_t solve_impl(uint64_t start_L)
 
                 for (uint32_t i = 0; i < b_count; ++i)
                 {
-                    if (i + 24 < b_count) [[likely]]
-                        __builtin_prefetch(&primes_fast[b_items[i + 24].p_idx], 0, 1);
+                    if (i + 16 < b_count) [[likely]]
+                        __builtin_prefetch(&primes_fast[b_items[i + 16].p_idx], 0, 1);
 
                     uint32_t p_idx = b_items[i].p_idx;
                     uint32_t offset = b_items[i].offset;
 
                     uint64_t inv_p = primes_fast[p_idx].inv_p;
                     uint64_t limit = primes_fast[p_idx].limit;
-                    uint64_t inv_p2 = inv_p * inv_p;
 
                     uint64_t val = rem_ptr[offset];
                     uint64_t temp = val * inv_p;
-                    uint64_t q = val * inv_p2;
+                    uint64_t q = temp * inv_p;
 
                     if (q <= limit) [[unlikely]]
                     {
@@ -560,6 +510,32 @@ int main()
     std::cout << "Primes generated in " << std::chrono::duration<double>(end_primes - start_primes).count()
               << " seconds.\n\n";
 
+#ifdef BENCHMARK
+    uint64_t k = 12;
+    uint64_t start_L = 5000000000000ULL;
+    uint64_t total_chunks = 10000ULL;
+    uint64_t CHUNK_SIZE = 1048576ULL;
+
+    std::cout << "--- BENCHMARK MODE ---\n";
+    std::cout << "Testing k=" << k << " | Workload: " << (total_chunks * CHUNK_SIZE) / 1000000 << " M candidates\n\n";
+
+    for (int run = 1; run <= 5; ++run)
+    {
+        auto start = std::chrono::high_resolution_clock::now();
+        uint64_t ans = solve(k, start_L);
+        auto end = std::chrono::high_resolution_clock::now();
+
+        std::chrono::duration<double> elapsed = end - start;
+        double seconds = elapsed.count();
+
+        uint64_t candidates_checked = total_chunks * CHUNK_SIZE;
+        double speed = candidates_checked / seconds;
+
+        std::cout << "Run " << run
+                  << " | Time: " << std::fixed << std::setprecision(4) << std::setw(8) << seconds << " s"
+                  << " | Speed: " << std::fixed << std::setprecision(2) << std::setw(8) << (speed / 1e6) << " M candidates/s\n";
+    }
+#else
     uint64_t start_k = 1;
     uint64_t start_L = 1;
 
@@ -614,6 +590,7 @@ int main()
 
     std::error_code ec;
     std::filesystem::remove("checkpoint-396.txt", ec);
+#endif
 
     return 0;
 }

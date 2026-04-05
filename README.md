@@ -38,27 +38,25 @@ n = 25 | min k =   1070858041561 | Time:    1505.2951 s | Speed:   711.39 M cand
 
 
 **Problem 396:**
-Compiling: I use GCC 15.2
+Compiling: I use Clang 21.1.8, building on a box with 5.1GHz Ryzen 7 9800X3D
 ```
-g++ -O3 -march=native -std=c++23 .\erdos_problem_396.cpp -o erdos_problem_396.exe
+clang++ -O3 -march=native -std=c++23 .\erdos_problem_396.cpp -o erdos_problem_396.exe -pthread
 ```
 Current performance:
 ```
 Detected 8 logical cores. Using C++ Thread Pool...
 Generating primes up to 200,000,000...
-Primes generated in 1.50281 seconds.
+Primes generated in 0.617694 seconds.
 
-k =  1 | min n =               2 | Time:       0.0068 s | Speed:     0.00 M candidates/s
-k =  2 | min n =            2480 | Time:       0.0066 s | Speed:     0.38 M candidates/s
-k =  3 | min n =            8178 | Time:       0.0056 s | Speed:     1.01 M candidates/s
-k =  4 | min n =           45153 | Time:       0.0061 s | Speed:     6.08 M candidates/s
-k =  5 | min n =         3648841 | Time:       0.0078 s | Speed:   463.96 M candidates/s
-k =  6 | min n =         7979090 | Time:       0.0065 s | Speed:   661.95 M candidates/s
-k =  7 | min n =       101130029 | Time:       0.0476 s | Speed:  1956.20 M candidates/s
-k =  8 | min n =       339949252 | Time:       0.1127 s | Speed:  2119.92 M candidates/s
-k =  9 | min n =      1019547844 | Time:       0.3192 s | Speed:  2128.89 M candidates/s
-k = 10 | min n =     17609764994 | Time:      10.8329 s | Speed:  1531.46 M candidates/s
-k = 11 | min n =   1070858041585 | Time:    1002.0033 s | Speed:  1051.14 M candidates/s
-k = 12 | min n =   5048891644646 | Time:    4960.9317 s | Speed:   801.87 M candidates/s
-k = 13 | min n =  18253129921842 | Time:   22360.3519 s | Speed:   590.52 M candidates/s
+k =  1 | min n =               2 | Time:       0.0037 s | Speed:     0.00 M candidates/s
+k =  2 | min n =            2480 | Time:       0.0026 s | Speed:     0.96 M candidates/s
+k =  3 | min n =            8178 | Time:       0.0022 s | Speed:     2.58 M candidates/s
+k =  4 | min n =           45153 | Time:       0.0021 s | Speed:    17.26 M candidates/s
+k =  5 | min n =         3648841 | Time:       0.0020 s | Speed:  1791.85 M candidates/s
+k =  6 | min n =         7979090 | Time:       0.0016 s | Speed:  2641.37 M candidates/s
+k =  7 | min n =       101130029 | Time:       0.0190 s | Speed:  4901.29 M candidates/s
+k =  8 | min n =       339949252 | Time:       0.0461 s | Speed:  5179.35 M candidates/s
+k =  9 | min n =      1019547844 | Time:       0.1362 s | Speed:  4990.57 M candidates/s
+k = 10 | min n =     17609764994 | Time:       3.5138 s | Speed:  4721.40 M candidates/s
+k = 11 | min n =   1070858041585 | Time:     286.0180 s | Speed:  3682.45 M candidates/s
 ```
