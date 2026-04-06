@@ -132,7 +132,9 @@ template <uint64_t K> bool exact_check(uint64_t n)
         if (p > 2 * K)
             break;
 
-        uint64_t nu_prod = 0, nu_comb = 0, power = p;
+        uint64_t nu_prod = 0;
+        uint64_t nu_comb = 0;
+        uint64_t power = p;
         while (true)
         {
             uint64_t v_n = n / power;
@@ -169,13 +171,16 @@ template <uint64_t K> bool exact_check(uint64_t n)
             {
                 if (temp > 2 * K)
                 {
-                    uint64_t p_val = temp, nu_prod = 1, t2 = (n - i) / p_val;
+                    uint64_t p_val = temp;
+                    uint64_t nu_prod = 1;
+                    uint64_t t2 = (n - i) / p_val;
                     while (t2 > 0 && t2 % p_val == 0)
                     {
                         nu_prod++;
                         t2 /= p_val;
                     }
-                    uint64_t nu_comb = 0, power = p_val;
+                    uint64_t nu_comb = 0;
+                    uint64_t power = p_val;
                     while (true)
                     {
                         uint64_t v_n = n / power;
@@ -199,7 +204,8 @@ template <uint64_t K> bool exact_check(uint64_t n)
                     temp = q;
                     q = temp * pd.inv_p;
                 }
-                uint64_t nu_comb = 0, power = p;
+                uint64_t nu_comb = 0;
+                uint64_t power = p;
                 while (true)
                 {
                     uint64_t v_n = n / power;
@@ -222,7 +228,9 @@ inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t &
     uint32_t j = start_j;
     for (; j < W_block; j += p)
     {
-        uint64_t val = rem[j], temp = val * inv_p, q = temp * inv_p;
+        uint64_t val = rem[j];
+        uint64_t temp = val * inv_p;
+        uint64_t q = temp * inv_p;
         if (q <= limit) [[unlikely]]
         {
             temp = q;
@@ -354,7 +362,8 @@ template <uint64_t K> uint64_t solve_impl(uint64_t start_L)
                     }
                 }
 
-                uint32_t overlap = 0, j = 0;
+                uint32_t overlap = 0;
+                uint32_t j = 0;
                 for (uint32_t block_start = 0; block_start < CHUNK_W; block_start += OPT_BLOCK_SIZE)
                 {
                     uint32_t block_idx = block_start >> BLOCK_SHIFT;
@@ -389,9 +398,15 @@ template <uint64_t K> uint64_t solve_impl(uint64_t start_L)
                     {
                         if (i + 8 < b_count) [[likely]]
                             __builtin_prefetch(&primes_fast[b_items[i + 8].p_idx], 0);
-                        uint32_t p_idx = b_items[i].p_idx, offset = b_items[i].offset;
-                        uint64_t inv_p = primes_fast[p_idx].inv_p, limit = primes_fast[p_idx].limit;
-                        uint64_t val = rem_ptr[offset], temp = val * inv_p, q = temp * inv_p;
+                        uint32_t p_idx = b_items[i].p_idx;
+                        uint32_t offset = b_items[i].offset;
+
+                        uint64_t inv_p = primes_fast[p_idx].inv_p;
+                        uint64_t limit = primes_fast[p_idx].limit;
+
+                        uint64_t val = rem_ptr[offset];
+                        uint64_t temp = val * inv_p;
+                        uint64_t q = temp * inv_p;
 
                         if (q <= limit) [[unlikely]]
                         {
