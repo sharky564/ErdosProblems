@@ -118,7 +118,8 @@ void get_primes(uint32_t limit)
     }
 }
 
-template <uint64_t K> bool exact_check(uint64_t n)
+template <uint64_t K>
+bool exact_check(uint64_t n)
 {
     uint32_t nu_2_prod = std::popcount(n - K - 1) - std::popcount(n) + K + 1;
     if (std::popcount(n) < nu_2_prod) [[unlikely]]
@@ -247,7 +248,8 @@ inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t &
     start_j = j - W_block;
 }
 
-template <uint64_t K> uint64_t solve_impl(uint64_t start_L)
+template <uint64_t K>
+uint64_t solve_impl(uint64_t start_L)
 {
     const uint64_t SUB_CHUNK_SIZE = 1048576ULL;
     const uint64_t SUPER_CHUNK_SIZE = S_CHUNKS * SUB_CHUNK_SIZE;
