@@ -25,10 +25,10 @@ struct PrimeData
     uint8_t shift;
 };
 
-struct PrimeFast
+struct alignas(16) PrimeBucketData
 {
     uint64_t inv_p;
-    uint64_t limit;
+    uint32_t p;
 };
 
 struct BucketItem
@@ -70,8 +70,10 @@ struct FastBucket
         }
     }
 
-    inline void push_back_unsafe(uint32_t p_idx, uint32_t offset)
+    inline void push_back(uint32_t p_idx, uint32_t offset)
     {
+        if (count == cap) [[unlikely]]
+            reserve(cap == 0 ? 32768 : cap * 2);
         data[count].p_idx = p_idx;
         data[count].offset = offset;
         ++count;
@@ -84,7 +86,7 @@ struct alignas(64) AlignedAtomic
 };
 
 std::vector<PrimeData> primes;
-std::vector<PrimeFast> primes_fast;
+std::vector<PrimeBucketData> primes_bucket;
 
 void get_primes(uint32_t limit)
 {
@@ -113,13 +115,12 @@ void get_primes(uint32_t limit)
                     inv *= 2 - p * inv;
             }
             primes.push_back({(uint64_t)magic_128, inv, UINT64_MAX / p, p, shift});
-            primes_fast.push_back({inv, UINT64_MAX / p});
+            primes_bucket.push_back({inv, p});
         }
     }
 }
 
-template <uint64_t K>
-bool exact_check(uint64_t n)
+template <uint64_t K> bool exact_check(uint64_t n)
 {
     uint32_t nu_2_prod = std::popcount(n - K - 1) - std::popcount(n) + K + 1;
     if (std::popcount(n) < nu_2_prod) [[unlikely]]
@@ -248,29 +249,30 @@ inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t &
     start_j = j - W_block;
 }
 
-template <uint64_t K>
-uint64_t solve_impl(uint64_t start_L)
+template <uint64_t K> uint64_t solve_impl(uint64_t start_L)
 {
     const uint64_t SUB_CHUNK_SIZE = 1048576ULL;
     const uint64_t SUPER_CHUNK_SIZE = S_CHUNKS * SUB_CHUNK_SIZE;
 
+    const uint32_t OPT_BLOCK_SIZE = 65536;
+    const uint32_t BLOCK_SHIFT = std::countr_zero(OPT_BLOCK_SIZE);
+    const uint32_t BLOCK_MASK = OPT_BLOCK_SIZE - 1;
+
     std::atomic<uint64_t> current_chunk{0};
     std::atomic<uint64_t> global_min_n{static_cast<uint64_t>(-1)};
     std::vector<AlignedAtomic> active_chunks(NUM_THREADS);
-
     auto start_time = std::chrono::high_resolution_clock::now();
 
     auto worker = [&](uint32_t thread_index) {
-        const uint32_t OPT_BLOCK_SIZE = 65536;
-        const uint32_t BLOCK_SHIFT = std::countr_zero(OPT_BLOCK_SIZE);
-        const uint32_t BLOCK_MASK = OPT_BLOCK_SIZE - 1;
-        const uint32_t FAST_BUCKET_SIZE = SUB_CHUNK_SIZE / OPT_BLOCK_SIZE + 1;
-
         std::vector<uint64_t> rem(OPT_BLOCK_SIZE + 32);
         std::vector<uint32_t> prime_offsets;
-        std::vector<uint32_t> active_large_primes;
 
-        FastBucket buckets[FAST_BUCKET_SIZE];
+        uint32_t MAX_SUPER_W = SUPER_CHUNK_SIZE + K;
+        uint32_t TOTAL_BLOCKS = (MAX_SUPER_W + OPT_BLOCK_SIZE - 1) >> BLOCK_SHIFT;
+
+        std::vector<FastBucket> block_buckets(TOTAL_BLOCKS);
+        for (uint32_t b = 0; b < TOTAL_BLOCKS; ++b)
+            block_buckets[b].reserve(32768);
 
         while (true)
         {
@@ -286,6 +288,7 @@ uint64_t solve_impl(uint64_t start_L)
 #endif
             uint64_t L_super = start_L + super_chunk_id * SUPER_CHUNK_SIZE;
             uint64_t R_super = L_super + SUPER_CHUNK_SIZE + K - 1;
+            uint32_t SUPER_W = (uint32_t)(R_super - L_super + 1);
 
             if (L_super > global_min_n.load(std::memory_order_relaxed))
             {
@@ -305,9 +308,8 @@ uint64_t solve_impl(uint64_t start_L)
             size_t first_large_prime_idx = std::distance(primes.begin(), it_large);
 
             uint32_t p_thresh = std::max<uint32_t>(2 * K, (uint32_t)std::cbrt(2.0 * R_super) + 2);
-            active_large_primes.clear();
 
-            for (size_t idx = first_large_prime_idx; idx < chunk_total_primes; ++idx)
+            for (size_t idx = 1; idx < first_large_prime_idx; ++idx)
             {
                 uint32_t p = primes[idx].p;
                 if (p > p_thresh)
@@ -315,162 +317,150 @@ uint64_t solve_impl(uint64_t start_L)
                     uint64_t p2 = (uint64_t)p * p;
                     uint64_t c = L_super / p2;
                     if (2 * R_super < (2 * c + 1) * p2)
-                        continue; // Unconditionally discard
+                    {
+                        prime_offsets[idx] = UINT32_MAX;
+                        continue;
+                    }
                 }
-                active_large_primes.push_back((uint32_t)idx);
                 uint64_t num = L_super + p - 1;
                 uint64_t start_c =
                     (uint64_t)((((unsigned __int128)num * primes[idx].magic) >> 64) >> primes[idx].shift);
                 prime_offsets[idx] = (uint32_t)(start_c * p - L_super);
             }
-            uint32_t safe_cap = (uint32_t)active_large_primes.size();
-            for (int i = 0; i < FAST_BUCKET_SIZE; ++i)
-                buckets[i].reserve(safe_cap);
 
-            for (int sub = 0; sub < S_CHUNKS; ++sub)
+            auto it_thresh =
+                std::upper_bound(primes.begin() + first_large_prime_idx, primes.begin() + chunk_total_primes, p_thresh,
+                                 [](uint32_t val, const PrimeData &pd) { return val < pd.p; });
+            size_t thresh_idx = std::distance(primes.begin(), it_thresh);
+
+            for (size_t idx = first_large_prime_idx; idx < thresh_idx; ++idx)
             {
-                uint64_t L_chunk = L_super + sub * SUB_CHUNK_SIZE;
-                uint64_t R_chunk = L_chunk + SUB_CHUNK_SIZE + K - 1;
-                if (L_chunk > global_min_n.load(std::memory_order_relaxed))
+                uint32_t p = primes[idx].p;
+                uint64_t num = L_super + p - 1;
+                uint64_t start_c =
+                    (uint64_t)((((unsigned __int128)num * primes[idx].magic) >> 64) >> primes[idx].shift);
+                uint32_t first_hit = (uint32_t)(start_c * p - L_super);
+
+                if (first_hit < SUPER_W)
+                    block_buckets[first_hit >> BLOCK_SHIFT].push_back((uint32_t)idx, first_hit);
+            }
+
+            for (size_t idx = thresh_idx; idx < chunk_total_primes; ++idx)
+            {
+                uint32_t p = primes[idx].p;
+                uint64_t p2 = (uint64_t)p * p;
+                uint64_t c = L_super / p2;
+
+                if (2 * R_super < (2 * c + 1) * p2)
+                    continue;
+
+                uint64_t num = L_super + p - 1;
+                uint64_t start_c =
+                    (uint64_t)((((unsigned __int128)num * primes[idx].magic) >> 64) >> primes[idx].shift);
+                uint32_t first_hit = (uint32_t)(start_c * p - L_super);
+
+                if (first_hit < SUPER_W)
+                    block_buckets[first_hit >> BLOCK_SHIFT].push_back((uint32_t)idx, first_hit);
+            }
+
+            uint32_t overlap = 0, j = 0;
+            for (uint32_t b = 0; b < TOTAL_BLOCKS; ++b)
+            {
+                uint64_t block_L = L_super + b * OPT_BLOCK_SIZE;
+                uint64_t block_R = std::min(R_super, block_L + OPT_BLOCK_SIZE - 1);
+                if (block_L > block_R)
                     break;
 
-                uint32_t CHUNK_W = (uint32_t)(R_chunk - L_chunk + 1);
-                for (int i = 0; i < FAST_BUCKET_SIZE; ++i)
-                    buckets[i].clear();
+                uint32_t num_new = (uint32_t)(block_R - block_L + 1);
+
+                uint64_t x = block_L;
+                for (uint32_t idx_new = 0; idx_new < num_new; ++idx_new, ++x)
+                    rem[overlap + idx_new] = x >> std::countr_zero(x);
+
+                uint64_t *rem_ptr = rem.data() + overlap;
 
                 for (size_t idx = 1; idx < first_large_prime_idx; ++idx)
                 {
-                    uint32_t p = primes[idx].p;
-                    uint64_t num = L_chunk + p - 1;
-                    uint64_t start_c =
-                        (uint64_t)((((unsigned __int128)num * primes[idx].magic) >> 64) >> primes[idx].shift);
-                    prime_offsets[idx] = (uint32_t)(start_c * p - L_chunk);
-                }
-                for (uint32_t idx : active_large_primes)
-                {
                     uint32_t start_j = prime_offsets[idx];
+                    if (start_j == UINT32_MAX)
+                        continue;
                     uint32_t p = primes[idx].p;
-
-                    while (start_j < SUB_CHUNK_SIZE)
+                    if (start_j < num_new)
                     {
-                        buckets[start_j >> BLOCK_SHIFT].push_back_unsafe(idx, start_j & BLOCK_MASK);
-                        start_j += p;
-                    }
-                    prime_offsets[idx] = start_j - SUB_CHUNK_SIZE;
-                    while (start_j < CHUNK_W)
-                    {
-                        buckets[start_j >> BLOCK_SHIFT].push_back_unsafe(idx, start_j & BLOCK_MASK);
-                        start_j += p;
-                    }
-                }
-
-                uint32_t overlap = 0;
-                uint32_t j = 0;
-                for (uint32_t block_start = 0; block_start < CHUNK_W; block_start += OPT_BLOCK_SIZE)
-                {
-                    uint32_t block_idx = block_start >> BLOCK_SHIFT;
-                    uint64_t block_L = L_chunk + block_start;
-                    uint64_t block_R = std::min(R_chunk, block_L + OPT_BLOCK_SIZE - 1);
-                    uint32_t num_new = (uint32_t)(block_R - block_L + 1);
-
-                    uint64_t x = block_L;
-                    for (uint32_t idx_new = 0; idx_new < num_new; ++idx_new, ++x)
-                        rem[overlap + idx_new] = x >> std::countr_zero(x);
-
-                    uint64_t *rem_ptr = rem.data() + overlap;
-
-                    for (size_t idx = 1; idx < first_large_prime_idx; ++idx)
-                    {
-                        uint32_t p = primes[idx].p, start_j = prime_offsets[idx];
-                        if (start_j < num_new)
-                        {
-                            process_p_dyn(p, primes[idx].inv_p, primes[idx].limit, start_j, num_new, rem_ptr);
-                            prime_offsets[idx] = start_j;
-                        }
-                        else
-                        {
-                            prime_offsets[idx] = start_j - num_new;
-                        }
-                    }
-
-                    uint32_t b_count = buckets[block_idx].count;
-                    BucketItem *b_items = buckets[block_idx].data;
-
-                    for (uint32_t i = 0; i < b_count; ++i)
-                    {
-                        if (i + 8 < b_count) [[likely]]
-                            __builtin_prefetch(&primes_fast[b_items[i + 8].p_idx], 0);
-                        uint32_t p_idx = b_items[i].p_idx;
-                        uint32_t offset = b_items[i].offset;
-
-                        uint64_t inv_p = primes_fast[p_idx].inv_p;
-                        uint64_t limit = primes_fast[p_idx].limit;
-
-                        uint64_t val = rem_ptr[offset];
-                        uint64_t temp = val * inv_p;
-                        uint64_t q = temp * inv_p;
-
-                        if (q <= limit) [[unlikely]]
-                        {
-                            temp = q;
-                            while (true)
-                            {
-                                q = temp * inv_p;
-                                if (q > limit)
-                                    break;
-                                temp = q;
-                            }
-                        }
-                        rem_ptr[offset] = temp;
-                    }
-
-                    uint32_t W_search = overlap + num_new;
-                    while (j + K < W_search)
-                    {
-                        if (rem[j + K] != 1) [[likely]]
-                        {
-                            j += K + 1;
-                        }
-                        else
-                        {
-                            int i = K - 1;
-                            while (i >= 0 && rem[j + i] == 1)
-                                --i;
-
-                            if (i < 0)
-                            {
-                                uint64_t n = block_L - overlap + j + K;
-                                if (n > K && n < global_min_n.load(std::memory_order_relaxed))
-                                {
-                                    if (exact_check<K>(n))
-                                    {
-                                        uint64_t current = global_min_n.load(std::memory_order_relaxed);
-                                        while (n < current && !global_min_n.compare_exchange_weak(
-                                                                  current, n, std::memory_order_relaxed))
-                                        {
-                                        }
-                                    }
-                                }
-                                ++j;
-                            }
-                            else
-                            {
-                                j += i + 1;
-                            }
-                        }
-                    }
-
-                    if (W_search >= K)
-                    {
-                        for (uint32_t i = 0; i < K; ++i)
-                            rem[i] = rem[W_search - K + i];
-                        j -= (W_search - K);
-                        overlap = K;
+                        process_p_dyn(p, primes[idx].inv_p, primes[idx].limit, start_j, num_new, rem_ptr);
+                        prime_offsets[idx] = start_j;
                     }
                     else
                     {
-                        overlap = W_search;
+                        prime_offsets[idx] = start_j - num_new;
                     }
+                }
+
+                uint32_t b_count = block_buckets[b].count;
+                BucketItem *b_items = block_buckets[b].data;
+
+                for (uint32_t i = 0; i < b_count; ++i)
+                {
+                    if (i + 8 < b_count) [[likely]]
+                        __builtin_prefetch(&primes_bucket[b_items[i + 8].p_idx], 0);
+
+                    uint32_t p_idx = b_items[i].p_idx;
+                    uint32_t hit_offset = b_items[i].offset;
+
+                    rem_ptr[hit_offset & BLOCK_MASK] *= primes_bucket[p_idx].inv_p;
+
+                    uint32_t next_hit = hit_offset + primes_bucket[p_idx].p;
+                    if (next_hit < SUPER_W) [[likely]]
+                        block_buckets[next_hit >> BLOCK_SHIFT].push_back(p_idx, next_hit);
+                }
+
+                block_buckets[b].clear();
+
+                uint32_t W_search = overlap + num_new;
+                while (j + K < W_search)
+                {
+                    if (rem[j + K] != 1) [[likely]]
+                    {
+                        j += K + 1;
+                    }
+                    else
+                    {
+                        int i = K - 1;
+                        while (i >= 0 && rem[j + i] == 1)
+                            --i;
+                        if (i < 0)
+                        {
+                            uint64_t n = block_L - overlap + j + K;
+                            if (n > K && n < global_min_n.load(std::memory_order_relaxed))
+                            {
+                                if (exact_check<K>(n))
+                                {
+                                    uint64_t current = global_min_n.load(std::memory_order_relaxed);
+                                    while (n < current &&
+                                           !global_min_n.compare_exchange_weak(current, n, std::memory_order_relaxed))
+                                    {
+                                    }
+                                }
+                            }
+                            ++j;
+                        }
+                        else
+                        {
+                            j += i + 1;
+                        }
+                    }
+                }
+
+                if (W_search >= K)
+                {
+                    for (uint32_t i = 0; i < K; ++i)
+                        rem[i] = rem[W_search - K + i];
+                    j -= (W_search - K);
+                    overlap = K;
+                }
+                else
+                {
+                    overlap = W_search;
                 }
             }
 
@@ -567,36 +557,43 @@ uint64_t solve(uint64_t k, uint64_t start_L)
 int main()
 {
     std::cout << "Detected " << NUM_THREADS << " logical cores. Using C++ Thread Pool...\n";
-    std::cout << "Generating primes up to 200,000,000...\n";
+    const int MAX_PRIMES = 500'000'000;
+    std::cout << "Generating primes up to " << MAX_PRIMES << "...\n";
     auto start_primes = std::chrono::high_resolution_clock::now();
-    get_primes(200000000);
+    get_primes(MAX_PRIMES);
     std::cout << "Primes generated in "
               << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_primes).count()
               << " seconds.\n\n";
 
 #ifdef BENCHMARK
-    uint64_t k = 14;
-    uint64_t start_L = 359'000'000'000'000ULL;
-    uint64_t total_chunks = ((10000ULL + S_CHUNKS - 1) / S_CHUNKS) * S_CHUNKS;
-    uint64_t CHUNK_SIZE = 1048576ULL;
-
-    std::cout << "--- BENCHMARK MODE ---\n";
-    std::cout << "Testing S_CHUNKS=" << S_CHUNKS << " | k=" << k
-              << " | Workload: " << (total_chunks * CHUNK_SIZE) / 1000000 << " M candidates\n\n";
-
-    for (int run = 1; run <= 5; ++run)
+    std::vector<std::pair<uint64_t, uint64_t>> tests{
+        {11, 1'000'000'000'000ULL},   {12, 5'000'000'000'000ULL},     {13, 18'000'000'000'000ULL},
+        {14, 359'000'000'000'000ULL}, {15, 2'880'000'000'000'000ULL},
+    };
+    for (const auto [k, start_L] : tests)
     {
-        auto start = std::chrono::high_resolution_clock::now();
-        uint64_t ans = solve(k, start_L);
-        double seconds = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
-        double speed = (total_chunks * CHUNK_SIZE) / seconds;
-        std::cout << "Run " << run << " | Time: " << std::fixed << std::setprecision(4) << std::setw(8) << seconds
-                  << " s"
-                  << " | Speed: " << std::fixed << std::setprecision(2) << std::setw(8) << (speed / 1e6)
-                  << " M candidates/s\n";
+        uint64_t total_chunks = ((10000ULL + S_CHUNKS - 1) / S_CHUNKS) * S_CHUNKS;
+        uint64_t CHUNK_SIZE = 1048576ULL;
+
+        std::cout << "--- BENCHMARK MODE ---\n";
+        std::cout << "Testing k=" << k << " | Workload: " << (total_chunks * CHUNK_SIZE) / 1000000
+                  << " M candidates\n\n";
+
+        for (int run = 1; run <= 5; ++run)
+        {
+            auto start = std::chrono::high_resolution_clock::now();
+            uint64_t ans = solve(k, start_L);
+            double seconds = std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start).count();
+            double speed = (total_chunks * CHUNK_SIZE) / seconds;
+            std::cout << "Run " << run << " | Time: " << std::fixed << std::setprecision(4) << std::setw(8) << seconds
+                      << " s"
+                      << " | Speed: " << std::fixed << std::setprecision(2) << std::setw(8) << (speed / 1e6)
+                      << " M candidates/s\n";
+        }
     }
 #else
-    uint64_t start_k = 1, start_L = 1;
+    uint64_t start_k = 1;
+    uint64_t start_L = 1;
 
     if (std::filesystem::exists("checkpoint-396.txt"))
     {
