@@ -1,6 +1,3 @@
-#pragma GCC optimize("O3,unroll-loops")
-#pragma GCC target("avx2,bmi,bmi2,lzcnt,popcnt")
-
 #include <iostream>
 #include <vector>
 #include <cmath>
@@ -40,8 +37,8 @@ struct FastBucket
 
     FastBucket()
     {
-        cap = 16384;
-        data = static_cast<BucketItem*>(std::malloc(cap * sizeof(BucketItem)));
+        cap = 0;
+        data = nullptr;
         count = 0;
     }
 
@@ -52,13 +49,17 @@ struct FastBucket
 
     inline void clear() { count = 0; }
 
-    inline void push_back(uint32_t p_idx, uint32_t offset)
+    void reserve(uint32_t new_cap)
     {
-        if (count == cap) [[unlikely]]
+        if (new_cap > cap) [[unlikely]]
         {
-            cap *= 2;
+            cap = new_cap;
             data = static_cast<BucketItem*>(std::realloc(data, cap * sizeof(BucketItem)));
         }
+    }
+
+    inline void push_back_unsafe(uint32_t p_idx, uint32_t offset)
+    {
         data[count].p_idx = p_idx;
         data[count].offset = offset;
         ++count;
@@ -231,38 +232,6 @@ bool exact_check(uint64_t N, uint64_t m)
     return true;
 }
 
-template<uint32_t p>
-inline void process_prime_p(uint32_t& start_j, uint32_t W_block, uint64_t* rem)
-{
-    constexpr uint64_t inv_p =[]() {
-        uint64_t inv = p;
-        for (int i = 0; i < 5; ++i)
-            inv *= 2 - p * inv;
-        return inv;
-    }();
-    constexpr uint64_t limit = UINT64_MAX / p;
-
-    uint32_t j = start_j;
-    for (; j < W_block; j += p)
-    {
-        uint64_t temp = rem[j] * inv_p;
-        uint64_t q = temp * inv_p;
-        if (q <= limit) [[unlikely]]
-        {
-            temp = q;
-            while (true)
-            {
-                q = temp * inv_p;
-                if (q > limit)
-                    break;
-                temp = q;
-            }
-        }
-        rem[j] = temp;
-    }
-    start_j = j - W_block;
-}
-
 inline void process_p_dyn(uint32_t p, uint64_t inv_p, uint64_t limit, uint32_t& start_j, uint32_t W_block, uint64_t* rem)
 {
     uint32_t j = start_j;
@@ -301,14 +270,15 @@ uint64_t solve(uint64_t n, uint64_t start_L)
 
     auto start_time = std::chrono::high_resolution_clock::now();
     auto worker = [&](uint32_t thread_index) {
-        const uint32_t OPT_BLOCK_SIZE = 32768;
-        const uint32_t BLOCK_SHIFT = 15;
-        const uint32_t BLOCK_MASK = 32767;
+        const uint32_t OPT_BLOCK_SIZE = 65536;
+        const uint32_t BLOCK_SHIFT = std::countr_zero(OPT_BLOCK_SIZE);
+        const uint32_t BLOCK_MASK = OPT_BLOCK_SIZE - 1;
+        const uint32_t FAST_BUCKET_SIZE = CHUNK_SIZE / OPT_BLOCK_SIZE + 1;
 
         std::vector<uint64_t> rem(OPT_BLOCK_SIZE + 32);
         std::vector<uint32_t> prime_offsets;
 
-        FastBucket buckets[33];
+        FastBucket buckets[FAST_BUCKET_SIZE];
 
         while (true)
         {
@@ -352,8 +322,13 @@ uint64_t solve(uint64_t n, uint64_t start_L)
                 prime_offsets[idx] = (uint32_t)(start_c * p - L_chunk);
             }
 
-            for (int i = 0; i < 33; ++i)
+            uint32_t safe_cap = (uint32_t)(chunk_total_primes - first_large_prime_idx);
+
+            for (int i = 0; i < FAST_BUCKET_SIZE; ++i)
+            {
+                buckets[i].reserve(safe_cap);
                 buckets[i].clear();
+            }
 
             for (size_t idx = first_large_prime_idx; idx < chunk_total_primes; ++idx)
             {
@@ -364,7 +339,7 @@ uint64_t solve(uint64_t n, uint64_t start_L)
                 uint32_t p = primes[idx].p;
                 while (start_j < CHUNK_W)
                 {
-                    buckets[start_j >> BLOCK_SHIFT].push_back((uint32_t)idx, (uint32_t)(start_j & BLOCK_MASK));
+                    buckets[start_j >> BLOCK_SHIFT].push_back_unsafe((uint32_t)idx, (uint32_t)(start_j & BLOCK_MASK));
                     start_j += p;
                 }
             }
@@ -395,18 +370,7 @@ uint64_t solve(uint64_t n, uint64_t start_L)
                         uint64_t inv_p = primes[idx].inv_p;
                         uint64_t limit = primes[idx].limit;
 
-                        #define PROCESS_PRIME(p_val) case p_val: process_prime_p<p_val>(start_j, num_new, rem_ptr); break;
-                        switch (p)
-                        {
-                            PROCESS_PRIME(3) PROCESS_PRIME(5) PROCESS_PRIME(7) PROCESS_PRIME(11)
-                            PROCESS_PRIME(13) PROCESS_PRIME(17) PROCESS_PRIME(19) PROCESS_PRIME(23)
-                            PROCESS_PRIME(29) PROCESS_PRIME(31) PROCESS_PRIME(37) PROCESS_PRIME(41)
-                            PROCESS_PRIME(43) PROCESS_PRIME(47) PROCESS_PRIME(53) PROCESS_PRIME(59)
-                            PROCESS_PRIME(61) PROCESS_PRIME(67) PROCESS_PRIME(71) PROCESS_PRIME(73)
-                            PROCESS_PRIME(79) PROCESS_PRIME(83) PROCESS_PRIME(89) PROCESS_PRIME(97)
-                            default: process_p_dyn(p, inv_p, limit, start_j, num_new, rem_ptr);
-                        }
-                        #undef PROCESS_PRIME
+                        process_p_dyn(p, inv_p, limit, start_j, num_new, rem_ptr);
                         prime_offsets[idx] = start_j;
                     }
                     else
@@ -421,7 +385,7 @@ uint64_t solve(uint64_t n, uint64_t start_L)
                 for (uint32_t i = 0; i < b_count; ++i)
                 {
                     if (i + 8 < b_count) [[likely]]
-                        __builtin_prefetch(&primes[b_items[i + 8].p_idx], 0, 1);
+                        __builtin_prefetch(&primes[b_items[i + 8].p_idx], 0);
 
                     uint32_t p_idx = b_items[i].p_idx;
                     uint32_t offset = b_items[i].offset;
@@ -568,7 +532,7 @@ int main()
         double speed = candidates_checked / seconds;
 
         std::ostringstream oss;
-        oss << "\nn = " << std::setw(2) << n
+        oss << "\rn = " << std::setw(2) << n
             << " | min k = " << std::setw(15) << ans
             << " | Time: " << std::fixed << std::setprecision(4) << std::setw(12) << seconds << " s"
             << " | Speed: " << std::fixed << std::setprecision(2) << std::setw(8) << (speed / 1e6) << " M candidates/s\n";
