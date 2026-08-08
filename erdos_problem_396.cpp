@@ -36,9 +36,27 @@
 // the fully-sieved numbers.
 //
 // Config macros: MAXP, KMAX, RUNS, BENCH_CANDS, BLOCKSZ + env NT / KMAX_RT.
+//
+// PGO (optional, measured marginal). Recipe:
+//   clang++ -O3 -march=x86-64-v3 -std=c++23 -DPRESIEVE3 -DBENCHMARK -DRUNS=1 \
+//           -DBENCH_CANDS=1048576000ULL -fprofile-instr-generate f.cpp -o gen
+//   LLVM_PROFILE_FILE=e.profraw ./gen
+//   llvm-profdata merge -output=e.profdata e.profraw
+//   clang++ ... -fprofile-instr-use=e.profdata f.cpp -o tuned
+// Verdict on Zen 5: a profile blended over k=11..16 is a wash (+5% at k=11,
+// +2% at k=14, -1% at k=12/13/15/16). A profile trained on the SAME k as the
+// run is worth ~+1.6% at k=16 and ~0 at k=13. Only worth the two-stage build
+// for a long single-k production run; each solve_impl<K> is its own template
+// instantiation, so train on the k you will actually run. The hot loops are
+// memory-bound with well-predicted branches, which is why PGO's usual levers
+// (block layout, inlining) find little.
 
+// MAXP must stay above sqrt(2R) for the deepest k searched: k=17 needs
+// ~5.5e8, so the old 5e8 default would abort mid-run ("Prime table
+// exhausted"). The table only grows on demand, so the higher cap is free
+// until a solve actually needs it. Must stay < 2^31 (LOG field packing).
 #ifndef MAXP
-#define MAXP 500'000'000
+#define MAXP 2'000'000'000
 #endif
 #ifndef KMAX
 #define KMAX 20
@@ -49,19 +67,45 @@
 #ifndef BENCH_CANDS
 #define BENCH_CANDS 10485760000ULL
 #endif
+// Block size = the span sieved out of one acc[] pass, and equally the cutoff
+// between the two ways a prime deposits mass: p <= BLOCKSZ rides the cheap
+// sequential strided-add path, p > BLOCKSZ goes through the buckets as a
+// random RMW plus a re-push. 2^19 measured best on Zen 5 (8c/96 MB L3) at
+// every k from 11 to 16 - it beats the old 2^16 by 6% at k=11 rising to 41%
+// at k=16. Two effects compound: the primes in (2^16, 2^19] supply ~40% of
+// all bucket hits and move to the strided path, and the count of
+// simultaneously-written buckets drops 8x. 2^20 and 2^21 are both worse
+// (acc no longer fits the 1 MB L2), as is 2^15.
+// Do NOT raise this above the 1'000'000 seeded in main()'s get_primes: that
+// call is what sorts big_powers, and extend_primes only skips appending to it
+// because every later prime exceeds BLOCKSZ. Past 1e6 the list goes unsorted,
+// Phase 2c's `bp.q > R_chunk` break fires early, and dropped mass becomes a
+// silent false negative. Asserted below.
 #ifndef BLOCKSZ
-#define BLOCKSZ 65536
+#define BLOCKSZ 524288
 #endif
-// Chunk size is chosen at RUNTIME per solve: 2^25 while the per-chunk prime
-// set is small (bucket working set dominates), 2^26 once it is large (per-prime
-// setup dominates). The bucket item packing is sized once for the maximum.
-// CHUNK_SWITCH_P: use the big chunk when the sieving prime bound reaches this.
-// Env override CHUNK_LOG=25|26 forces either side for A/B without recompiling.
+// Chunk size is chosen at RUNTIME per solve, on a ladder against the sieving
+// prime bound: 2^25 while the per-chunk prime set is small, then 2^26, then
+// 2^27. Each chunk pays a full prime-table rescan, so bigger chunks divide
+// that cost - but they also multiply the live bucket working set, and the
+// rescan is NOT the dominant term (ERDOS_PROF puts population at 0.2% of the
+// time at k=11 and still only 13% at k=16). Measured optimum per k: 2^25 to
+// k=13, 2^26 at k=14, 2^27 at k=15-16. 2^28 is never optimal at any k - it
+// loses 8-14% against the best rung - so CHUNK_MAX is a packing limit, not a
+// size to reach for. The bucket item packing is sized once for CHUNK_MAX.
+// Env override CHUNK_LOG=25..28 forces a size for A/B without recompiling.
 #ifndef CHUNK_SWITCH_P
-#define CHUNK_SWITCH_P 8000000.0
+#define CHUNK_SWITCH_P 1e7
 #endif
+#ifndef CHUNK_SWITCH_P2
+#define CHUNK_SWITCH_P2 5e7
+#endif
+// Initial per-block bucket capacity (items). Mean occupancy is
+// live-primes/blocks (~39k at k=16 with a 2^27 chunk and 2^19 blocks);
+// doubling growth handles both the tails and the low-k case, where far fewer
+// blocks share a much smaller prime set.
 #ifndef BUCKET_RESERVE
-#define BUCKET_RESERVE (BLOCKSZ / 2)
+#define BUCKET_RESERVE (BLOCKSZ / 8)
 #endif
 
 #include <algorithm>
@@ -74,9 +118,17 @@
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <immintrin.h>
+#include <memory>
 #include <sstream>
 #include <thread>
 #include <vector>
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+#endif
 
 static unsigned int detect_threads()
 {
@@ -85,11 +137,39 @@ static unsigned int detect_threads()
 }
 const unsigned int NUM_THREADS = detect_threads();
 
+// PIN=1 pins worker i to logical CPU i (Linux only). NUMA_COPIES=N keeps N
+// replicas of the read-only population streams, one per contiguous thread
+// group - with pinning, first-touch places each replica on that group's NUMA
+// node so the per-chunk prime-table streaming stays node-local. Both are
+// A/B knobs, off by default.
+static unsigned int detect_numa_copies()
+{
+    if (const char *e = std::getenv("NUMA_COPIES")) { int v = std::atoi(e); if (v > 1) return (unsigned)v; }
+    return 1;
+}
+const bool PIN_THREADS = []() { const char *e = std::getenv("PIN"); return e && std::atoi(e) != 0; }();
+const unsigned int NUMA_COPIES = detect_numa_copies();
+// ERDOS_PROF=1: per-solve population-vs-sweep wall time split (thread-summed).
+const bool PHASE_PROF = std::getenv("ERDOS_PROF") != nullptr;
+std::atomic<uint64_t> g_ns_pop{0}, g_ns_sweep{0};
+struct PopCopy
+{
+    std::vector<uint32_t> p;
+    std::vector<uint64_t> magic;
+    std::vector<uint16_t> meta;
+    std::atomic<int> ready{0};
+};
+std::vector<std::unique_ptr<PopCopy>> g_pop_copies;
+
 constexpr uint32_t OPT_BLOCK_SIZE = BLOCKSZ;
 constexpr uint32_t BLOCK_SHIFT = std::countr_zero(OPT_BLOCK_SIZE);
 constexpr uint32_t BLOCK_MASK = OPT_BLOCK_SIZE - 1;
 static_assert((OPT_BLOCK_SIZE & (OPT_BLOCK_SIZE - 1)) == 0, "block size must be a power of two");
 static_assert(OPT_BLOCK_SIZE >= 16384, "p^2 exclusion proof needs p > (2n)^(1/4); keep blocks >= 16384");
+static_assert(OPT_BLOCK_SIZE <= 1'000'000,
+              "blocks must stay under main()'s seed get_primes(1'000'000): that call is what sorts "
+              "big_powers, and extend_primes only skips appending to it because later primes exceed "
+              "the block size. A bigger block silently drops big-power mass in Phase 2c.");
 
 // ACCUMULATOR CONFIGS - pick one at compile time. All run the same sieve;
 // they trade table width and rounding budget against the range ceiling.
@@ -145,7 +225,12 @@ constexpr double ACC_OVERSHOOT = 19.0; // 0.5 * 37 terms (3^37 > 2^58)
 constexpr uint64_t RANGE_CAP = UINT64_MAX;
 #define ACC_CEIL_MSG "the u8 accumulator ceiling (~5.8e17): rebuild with -DSCALE3"
 #endif
-constexpr uint64_t BIGPOW_CAP = 1'000'000'000'000'000'000ULL;
+// Big prime powers must be enumerated all the way to the config's range
+// ceiling: a cap below R silently drops the mass of q in (cap, R], which is a
+// false-negative hazard (the old fixed 1e18 cap was fine only below 1e18).
+// Clamped to UINT64_MAX/2 so per-chunk alignment arithmetic (L + q - 1) can
+// never overflow.
+constexpr uint64_t BIGPOW_CAP = (RANGE_CAP > UINT64_MAX / 2) ? UINT64_MAX / 2 : RANGE_CAP;
 
 struct PrimeData
 {
@@ -177,22 +262,37 @@ struct BigPower       // odd prime power q = p^e > OPT_BLOCK_SIZE, p <= OPT_BLOC
 //   bits [0, OFF_BITS)              : offset within chunk
 //   bits [OFF_BITS, 2*OFF_BITS)     : stride = min(p_or_q, STRIDE_MASK); exact
 //                 for anything that can hit twice per chunk (p < CHUNK_W) -
-//                 larger strides saturate, which just drops them after one add
-//   bits [2*OFF_BITS, 64)           : LOG(p)  (<= 1023 for any 32-bit prime)
+//                 larger strides saturate past the chunk end (STRIDE_MASK >=
+//                 CHUNK_W, asserted below), which just drops them after one
+//                 add - their true next hit is outside the chunk too
+//   bits [2*OFF_BITS, 64)           : LOG(p) in LOG_BITS bits. u8 configs
+//                 need only 8 (LOG <= LOG_SCALE*31 = 124 for any p < 2^31 =
+//                 MAXP bound); ACC16 needs 10, which shrinks OFF_BITS and the
+//                 max chunk to 2^27-65536.
 // Population pushes only the FIRST hit per prime; the drain loop adds LOG and
 // re-pushes offset+stride (Oliveira e Silva style). Live bucket memory becomes
 // one pending item per active prime instead of every hit in the chunk upfront -
 // on multi-core boxes this keeps bucket traffic cache-resident instead of
 // streaming tens of MB per chunk per thread through DRAM.
+// CHUNK_MAX is (1 << OFF_BITS) - 65536 so CHUNK_W = chunk + K still fits the
+// offset field: 2^28-65536 for u8 configs. It is a packing ceiling, not a
+// target - the runtime ladder stops at 2^27 because the per-chunk prime-table
+// rescan it would divide is a minor term next to the bucket working set it
+// would inflate (see CHUNK_SWITCH_P).
+constexpr uint32_t LOG_BITS = (LOG_SCALE == 32) ? 10 : 8;
+constexpr uint32_t OFF_BITS = (64 - LOG_BITS) / 2; // 28 for u8 configs, 27 for ACC16
 constexpr uint64_t CHUNK_MIN = 33554432ULL;
-constexpr uint64_t CHUNK_MAX = 67108864ULL;
-constexpr uint32_t OFF_BITS = std::countr_zero(CHUNK_MAX) + 1; // holds CHUNK_W at max
+constexpr uint64_t CHUNK_MAX = (1ULL << OFF_BITS) - 65536;
 constexpr uint64_t OFF_MASK = (1ULL << OFF_BITS) - 1;
 constexpr uint32_t STRIDE_SHIFT = OFF_BITS;
 constexpr uint64_t STRIDE_MASK = (1ULL << OFF_BITS) - 1;         // exact for any p < CHUNK_W
 constexpr uint32_t LG_SHIFT = 2 * OFF_BITS;
-static_assert(2 * OFF_BITS + 10 <= 64, "chunk too large: LOG(p) needs 10 bits (CHUNK_MAX <= 2^26)");
+static_assert(2 * OFF_BITS + LOG_BITS <= 64, "item packing must fit one u64");
+static_assert(LOG_SCALE * 31 < (1 << LOG_BITS), "LOG(p) must fit its field for any p < 2^31 (MAXP cap)");
+static_assert((uint64_t)MAXP < (1ULL << 31), "LOG field packing assumes p < 2^31");
 static_assert(CHUNK_MAX + 64 <= (1ULL << OFF_BITS), "chunk offsets must fit the item offset field");
+static_assert(STRIDE_MASK >= CHUNK_MAX + 64,
+              "a saturated stride must always leave the chunk, or reinsertion adds mass at the wrong x");
 struct FastBucket
 {
     uint64_t *data;
@@ -224,6 +324,45 @@ struct FastBucket
     }
 };
 
+// acc spans 128 4 KB pages at BLOCKSZ 2^19 - past the L1 dTLB - so every
+// scattered strided/bucket RMW can pay an L2 TLB lookup. One 2 MB hugepage
+// covers the whole window with a single entry (worth ~1%). THP is 'madvise'
+// on most distros, so the mapping has to ask; falls back to calloc if the
+// mapping fails or the platform has no mmap.
+struct AccBuf
+{
+    acc_t *ptr = nullptr;
+    size_t sz = 0;
+    bool mapped = false;
+
+    explicit AccBuf(size_t n)
+    {
+#if defined(__linux__)
+        sz = (n * sizeof(acc_t) + (2u << 20) - 1) & ~(size_t)((2u << 20) - 1);
+        void *p = mmap(nullptr, sz, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (p != MAP_FAILED)
+        {
+#ifdef MADV_HUGEPAGE
+            madvise(p, sz, MADV_HUGEPAGE);
+#endif
+            ptr = static_cast<acc_t *>(p); // mmap pages arrive zeroed
+            mapped = true;
+            return;
+        }
+#endif
+        ptr = static_cast<acc_t *>(std::calloc(n, sizeof(acc_t)));
+    }
+    ~AccBuf()
+    {
+#if defined(__linux__)
+        if (mapped) { munmap(ptr, sz); return; }
+#endif
+        std::free(ptr);
+    }
+    AccBuf(const AccBuf &) = delete;
+    AccBuf &operator=(const AccBuf &) = delete;
+};
+
 struct alignas(64) AlignedAtomic
 {
     std::atomic<uint64_t> val{UINT64_MAX};
@@ -231,11 +370,13 @@ struct alignas(64) AlignedAtomic
 
 std::vector<PrimeData> primes;
 // Population-hot fields split out of the 32-byte PrimeData (which stays for
-// exact_check): sequential 21 B/prime streams instead of 32 B with dead weight.
+// exact_check): sequential 14 B/prime streams. The old separate shift (u8)
+// and prebuilt item (u64) streams are folded into one u16 - the stride and
+// LOG halves of the item are two shifts away from p and meta, and the ALU is
+// far cheaper than the extra 7 B/prime of DRAM streaming per chunk.
 std::vector<uint32_t> pop_p;
 std::vector<uint64_t> pop_magic;
-std::vector<uint8_t> pop_shift;
-std::vector<uint64_t> pop_item; // (min(p,STRIDE_MASK) << STRIDE_SHIFT) | (LOG(p) << LG_SHIFT)
+std::vector<uint16_t> pop_meta; // (shift << 10) | LOG(p)  (shift <= 30, LOG <= 1023)
 std::vector<Strider> small_striders;
 std::vector<BigPower> big_powers;
 
@@ -257,6 +398,20 @@ constexpr uint32_t PRESIEVE2_PERIOD = 215441;
 constexpr uint32_t PRESIEVE3_PERIOD = 31u * 37u * 41u * 43u;
 std::vector<acc_t> presieve3_pat;
 #endif
+// Optional fourth pattern {47,53,59,61}, period 8965109 (~9.5 MB table with
+// the block tail). Removes another ~0.073 scalar strided RMWs per candidate
+// for one more sequential byte per candidate in the fused init - a good trade
+// on paper (init is ~4% of the sweep, strided adds ~60%), but the primes it
+// covers are the CHEAP end of the strided path: q < 64 means their hits share
+// cache lines, so measured gain is only ~+0.5% (best at k=12-13). Needs an
+// L3 that can hold it alongside the other patterns. Opt in with -DPRESIEVE4.
+#if defined(PRESIEVE4) && !defined(PRESIEVE3)
+#error "PRESIEVE4 builds on PRESIEVE3's pattern - enable -DPRESIEVE3 as well"
+#endif
+#ifdef PRESIEVE4
+constexpr uint32_t PRESIEVE4_PERIOD = 47u * 53u * 59u * 61u;
+std::vector<acc_t> presieve4_pat;
+#endif
 std::vector<acc_t> presieve_pat;  // length PERIOD + OPT_BLOCK_SIZE
 std::vector<acc_t> presieve2_pat; // length PERIOD2 + OPT_BLOCK_SIZE
 std::vector<acc_t> tz_pat;        // LOG_SCALE*countr_zero(i & 65535), length 65536 + OPT_BLOCK_SIZE
@@ -267,6 +422,10 @@ constexpr bool in_presieve(uint32_t q)
         return true;
 #ifdef PRESIEVE3
     if (q == 31 || q == 37 || q == 41 || q == 43)
+        return true;
+#endif
+#ifdef PRESIEVE4
+    if (q == 47 || q == 53 || q == 59 || q == 61)
         return true;
 #endif
     return false;
@@ -294,8 +453,7 @@ void emit_prime(uint32_t p)
     primes.emplace_back(PrimeData{(uint64_t)magic_128, inv, UINT64_MAX / p, p, log2s, shift});
     pop_p.push_back(p);
     pop_magic.push_back((uint64_t)magic_128);
-    pop_shift.push_back(shift);
-    pop_item.push_back((std::min<uint64_t>(p, STRIDE_MASK) << STRIDE_SHIFT) | ((uint64_t)log2s << LG_SHIFT));
+    pop_meta.push_back((uint16_t)(((uint16_t)shift << 10) | log2s));
 
     if (p > 2 && p <= OPT_BLOCK_SIZE)
     {
@@ -380,6 +538,17 @@ void get_primes(uint32_t limit)
             uint16_t lg = (uint16_t)std::llround((double)LOG_SCALE * std::log2((double)qs3[t]));
             for (size_t mm = 0; mm < p3len; mm += qs3[t])
                 presieve3_pat[mm] += lg;
+        }
+#endif
+#ifdef PRESIEVE4
+        const size_t p4len = PRESIEVE4_PERIOD + OPT_BLOCK_SIZE;
+        presieve4_pat.assign(p4len, 0);
+        const uint32_t qs4[4] = {47, 53, 59, 61};
+        for (int t = 0; t < 4; ++t)
+        {
+            uint16_t lg = (uint16_t)std::llround((double)LOG_SCALE * std::log2((double)qs4[t]));
+            for (size_t mm = 0; mm < p4len; mm += qs4[t])
+                presieve4_pat[mm] += lg;
         }
 #endif
         const size_t tlen = 65536 + OPT_BLOCK_SIZE;
@@ -547,8 +716,57 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
     std::vector<AlignedAtomic> active_chunks(NUM_THREADS);
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    g_ns_pop.store(0, std::memory_order_relaxed);
+    g_ns_sweep.store(0, std::memory_order_relaxed);
+    g_pop_copies.clear();
+    if (NUMA_COPIES > 1)
+    {
+        g_pop_copies.resize(NUMA_COPIES);
+        for (auto &c : g_pop_copies)
+            c = std::make_unique<PopCopy>();
+    }
+
     auto worker = [&](uint32_t thread_index) {
-        std::vector<acc_t> acc(OPT_BLOCK_SIZE + 64);
+#ifdef __linux__
+        if (PIN_THREADS)
+        {
+            cpu_set_t cs;
+            CPU_ZERO(&cs);
+            CPU_SET(thread_index % std::thread::hardware_concurrency(), &cs);
+            pthread_setaffinity_np(pthread_self(), sizeof(cs), &cs);
+        }
+#endif
+        // Read-only population streams, optionally replicated per thread
+        // group: the group's first thread copies (first-touch = node-local
+        // pages when pinned), the rest wait on the ready flag.
+        const uint32_t *pop_p_l = pop_p.data();
+        const uint64_t *pop_magic_l = pop_magic.data();
+        const uint16_t *pop_meta_l = pop_meta.data();
+        if (NUMA_COPIES > 1)
+        {
+            uint32_t grp = (uint32_t)((uint64_t)thread_index * NUMA_COPIES / NUM_THREADS);
+            PopCopy &c = *g_pop_copies[grp];
+            uint32_t leader = (uint32_t)(((uint64_t)grp * NUM_THREADS + NUMA_COPIES - 1) / NUMA_COPIES);
+            if (thread_index == leader)
+            {
+                c.p = pop_p;
+                c.magic = pop_magic;
+                c.meta = pop_meta;
+                c.ready.store(1, std::memory_order_release);
+            }
+            else
+                while (!c.ready.load(std::memory_order_acquire))
+                    std::this_thread::yield();
+            pop_p_l = c.p.data();
+            pop_magic_l = c.magic.data();
+            pop_meta_l = c.meta.data();
+        }
+        AccBuf accbuf(OPT_BLOCK_SIZE + 64);
+        acc_t *const acc = accbuf.ptr;
+        // Survivor bitmap for the scan, one bit per window position. +4 words
+        // of slack so the 128-bit sliding window can always read one word
+        // past the last live one.
+        std::vector<uint64_t> surv((OPT_BLOCK_SIZE + 64) / 64 + 4);
         std::vector<ActiveStride> act;
         act.reserve(small_striders.size());
 
@@ -572,8 +790,19 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
             }
 #endif
             uint64_t L_chunk = start_L + chunk_id * CHUNK_SIZE;
-            uint64_t R_chunk = L_chunk + CHUNK_SIZE + K - 1;
-            uint32_t CHUNK_W = (uint32_t)(R_chunk - L_chunk + 1);
+            if (L_chunk >= g_end_L || L_chunk > global_min_n.load(std::memory_order_relaxed))
+            {
+                active_chunks[thread_index].val.store(UINT64_MAX, std::memory_order_release);
+                break;
+            }
+            // Clamp the final chunk to the worker range so this job never
+            // scans candidates owned by a neighbouring job: [start+K, end+K)
+            // exactly, whatever the chunk size (mirrors the GPU worker).
+            uint64_t span = CHUNK_SIZE;
+            if (g_end_L - L_chunk < span)
+                span = g_end_L - L_chunk;
+            uint64_t R_chunk = L_chunk + span + K - 1;
+            uint32_t CHUNK_W = (uint32_t)(span + K);
 
             // Overflow guard. acc can reach at most LOG_SCALE*log2(x) plus
             // the rounding overshoot (0.5 per odd prime-power term); only the
@@ -587,11 +816,10 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
                 std::cerr << "\nRange exceeds " ACC_CEIL_MSG ".\n";
                 std::exit(1);
             }
-            if (L_chunk >= g_end_L || L_chunk > global_min_n.load(std::memory_order_relaxed))
-            {
-                active_chunks[thread_index].val.store(UINT64_MAX, std::memory_order_release);
-                break;
-            }
+
+            std::chrono::steady_clock::time_point tp_pop, tp_sweep;
+            if (PHASE_PROF)
+                tp_pop = std::chrono::steady_clock::now();
 
             uint64_t max_p = std::max<uint64_t>(std::sqrt(2 * R_chunk) + 1, 2 * K);
             if (max_p > prime_limit) [[unlikely]]
@@ -639,16 +867,21 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
             size_t thresh_idx = std::distance(primes.begin(), it_thresh);
 
             // Phase 2a: Medium Primes (no Kummer skip possible) - first hit only;
-            // the drain loop reinserts subsequent hits.
+            // the drain loop reinserts subsequent hits. The bucket item is
+            // rebuilt from p and meta (two shifts) instead of streaming a
+            // prebuilt u64 per prime.
             for (size_t idx = first_large_prime_idx; idx < thresh_idx; ++idx)
             {
-                uint32_t p = pop_p[idx];
+                uint32_t p = pop_p_l[idx];
+                uint32_t meta = pop_meta_l[idx];
                 uint64_t num = L_chunk + p - 1;
-                uint64_t start_c = (uint64_t)((((unsigned __int128)num * pop_magic[idx]) >> 64) >> pop_shift[idx]);
+                uint64_t start_c = (uint64_t)((((unsigned __int128)num * pop_magic_l[idx]) >> 64) >> (meta >> 10));
                 uint32_t hit = (uint32_t)(start_c * p - L_chunk);
 
                 if (hit < CHUNK_W)
-                    block_buckets[hit >> BLOCK_SHIFT].push_back(pop_item[idx] | hit);
+                    block_buckets[hit >> BLOCK_SHIFT].push_back(
+                        (std::min<uint64_t>(p, STRIDE_MASK) << STRIDE_SHIFT) |
+                        ((uint64_t)(meta & 1023u) << LG_SHIFT) | hit);
             }
 
             // Phase 2b: Giant Primes (chunk-wide Kummer skip)
@@ -657,9 +890,10 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
             // floor(floor(L/p)/p), so two magic multiplies replace it.
             for (size_t idx = thresh_idx; idx < chunk_total_primes; ++idx)
             {
-                uint32_t p = pop_p[idx];
-                const uint64_t magic = pop_magic[idx];
-                const uint8_t shift = pop_shift[idx];
+                uint32_t p = pop_p_l[idx];
+                const uint64_t magic = pop_magic_l[idx];
+                const uint32_t meta = pop_meta_l[idx];
+                const uint32_t shift = meta >> 10;
                 uint64_t p2 = (uint64_t)p * p;
                 uint64_t d = (uint64_t)((((unsigned __int128)L_chunk * magic) >> 64) >> shift); // L / p
                 uint64_t c = (uint64_t)((((unsigned __int128)d * magic) >> 64) >> shift);       // L / p^2
@@ -671,7 +905,9 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
                 uint32_t hit = (uint32_t)(start_c * p - L_chunk);
 
                 if (hit < CHUNK_W)
-                    block_buckets[hit >> BLOCK_SHIFT].push_back(pop_item[idx] | hit);
+                    block_buckets[hit >> BLOCK_SHIFT].push_back(
+                        (std::min<uint64_t>(p, STRIDE_MASK) << STRIDE_SHIFT) |
+                        ((uint64_t)(meta & 1023u) << LG_SHIFT) | hit);
             }
 
             // Phase 2c: big prime powers q = p^e > OPT_BLOCK_SIZE (p <= OPT_BLOCK_SIZE):
@@ -699,8 +935,16 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
                 }
             }
 
+            if (PHASE_PROF)
+            {
+                tp_sweep = std::chrono::steady_clock::now();
+                g_ns_pop.fetch_add(
+                    (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(tp_sweep - tp_pop).count(),
+                    std::memory_order_relaxed);
+            }
+
             // Phase 3: The Uninterrupted Forward Sweep
-            uint32_t overlap = 0, j = 0;
+            uint32_t overlap = 0;
             for (uint32_t b = 0; b < TOTAL_BLOCKS; ++b)
             {
                 uint64_t block_L = L_chunk + b * OPT_BLOCK_SIZE;
@@ -712,11 +956,17 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
 
                 // init: 32*countr_zero(x) from a phase-shifted table, fused with the
                 // presieve pattern add - one contiguous, auto-vectorized u16 pass.
-                acc_t *acc_ptr = acc.data() + overlap;
+                acc_t *acc_ptr = acc + overlap;
                 const acc_t *tp = tz_pat.data() + (size_t)(block_L & 65535);
                 const acc_t *pp = presieve_pat.data() + (size_t)(block_L % PRESIEVE_PERIOD);
                 const acc_t *pp2 = presieve2_pat.data() + (size_t)(block_L % PRESIEVE2_PERIOD);
-#ifdef PRESIEVE3
+#if defined(PRESIEVE4)
+                const acc_t *pp3 = presieve3_pat.data() + (size_t)(block_L % PRESIEVE3_PERIOD);
+                const acc_t *pp4 = presieve4_pat.data() + (size_t)(block_L % PRESIEVE4_PERIOD);
+                for (uint32_t idx_new = 0; idx_new < num_new; ++idx_new)
+                    acc_ptr[idx_new] =
+                        (acc_t)(tp[idx_new] + pp[idx_new] + pp2[idx_new] + pp3[idx_new] + pp4[idx_new]);
+#elif defined(PRESIEVE3)
                 const acc_t *pp3 = presieve3_pat.data() + (size_t)(block_L % PRESIEVE3_PERIOD);
                 for (uint32_t idx_new = 0; idx_new < num_new; ++idx_new)
                     acc_ptr[idx_new] = (acc_t)(tp[idx_new] + pp[idx_new] + pp2[idx_new] + pp3[idx_new]);
@@ -731,6 +981,9 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
                     acc_t v = (acc_t)((uint32_t)std::countr_zero(mm) * LOG_SCALE + pp[j0] + pp2[j0]);
 #ifdef PRESIEVE3
                     v = (acc_t)(v + pp3[j0]);
+#endif
+#ifdef PRESIEVE4
+                    v = (acc_t)(v + pp4[j0]);
 #endif
                     acc_ptr[j0] = v;
                 }
@@ -776,20 +1029,64 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
                 acc_t T = t_f <= 0.0 ? 0 : (acc_t)t_f;
 
                 uint32_t W_search = overlap + num_new;
-                while (j + K < W_search)
+                // Scan. Two algorithms, picked by ISA:
+                //
+                // With AVX2: build a bitmap of (acc >= T), one compare per 32
+                // bytes, then find runs of K+1 set bits by shift-AND doubling
+                // (r &= r >> 1, 2, 4, ... marks runs of >= 2, 4, 8, ..., then
+                // one shift by RUN - done trims to exactly RUN). Branch-free,
+                // and it replaces a serial dependency chain - the scalar loop's
+                // next index depends on its branch and its load depends on the
+                // index, ~5 cycles of L1 latency per step, 9-19% of the sweep.
+                //
+                // Without AVX2: the bitmap build would cost a compare-and-branch
+                // per candidate, which is WORSE than the scalar skip-scan (that
+                // touches only 1 position in K+1). Measured ~3x slower on a
+                // non-AVX2 build, so the original algorithm is kept below.
+#if defined(__AVX2__) && !defined(ACC16)
                 {
-                    if (acc[j + K] < T) [[likely]]
+                    const uint32_t nwords = (W_search + 63) >> 6;
+                    for (uint32_t w = 0; w < nwords + 2; ++w)
+                        surv[w] = 0;
+                    const __m256i Tv = _mm256_set1_epi8((char)T);
+                    uint32_t b2 = 0;
+                    for (; b2 + 64 <= W_search; b2 += 64)
                     {
-                        j += K + 1;
+                        __m256i v0 = _mm256_loadu_si256((const __m256i *)(acc + b2));
+                        __m256i v1 = _mm256_loadu_si256((const __m256i *)(acc + b2 + 32));
+                        // unsigned compare: v >= T  <=>  max(v, T) == v
+                        uint32_t m0 =
+                            (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_max_epu8(v0, Tv), v0));
+                        uint32_t m1 =
+                            (uint32_t)_mm256_movemask_epi8(_mm256_cmpeq_epi8(_mm256_max_epu8(v1, Tv), v1));
+                        surv[b2 >> 6] = (uint64_t)m0 | ((uint64_t)m1 << 32);
                     }
-                    else
+                    for (; b2 < W_search; ++b2)
+                        if (acc[b2] >= T)
+                            surv[b2 >> 6] |= 1ULL << (b2 & 63);
+
+                    constexpr uint32_t RUN = (uint32_t)K + 1;
+                    const uint32_t last = (W_search > K) ? (W_search - (uint32_t)K) : 0; // exclusive
+                    for (uint32_t w = 0; w * 64 < last; ++w)
                     {
-                        int i = K - 1;
-                        while (i >= 0 && acc[j + i] >= T)
-                            --i;
-                        if (i < 0)
+                        unsigned __int128 v = (unsigned __int128)surv[w] | ((unsigned __int128)surv[w + 1] << 64);
+                        unsigned __int128 r = v;
+                        uint32_t done = 1;
+                        while (done * 2 <= RUN)
                         {
-                            uint64_t n = block_L - overlap + j + K;
+                            r &= r >> done;
+                            done *= 2;
+                        }
+                        if (done < RUN)
+                            r &= r >> (RUN - done);
+                        uint64_t hits = (uint64_t)r;
+                        while (hits)
+                        {
+                            uint32_t jj = w * 64 + (uint32_t)std::countr_zero(hits);
+                            hits &= hits - 1;
+                            if (jj >= last)
+                                break;
+                            uint64_t n = block_L - overlap + jj + K;
                             if (n > K && n < global_min_n.load(std::memory_order_relaxed))
                             {
                                 if (exact_check<K>(n))
@@ -801,20 +1098,52 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
                                     }
                                 }
                             }
-                            ++j;
-                        }
-                        else
-                        {
-                            j += i + 1;
                         }
                     }
                 }
+#else
+                {
+                    uint32_t j = 0;
+                    while (j + K < W_search)
+                    {
+                        if (acc[j + K] < T) [[likely]]
+                        {
+                            j += K + 1;
+                        }
+                        else
+                        {
+                            int i = (int)K - 1;
+                            while (i >= 0 && acc[j + i] >= T)
+                                --i;
+                            if (i < 0)
+                            {
+                            uint64_t n = block_L - overlap + j + K;
+                                if (n > K && n < global_min_n.load(std::memory_order_relaxed))
+                                {
+                                    if (exact_check<K>(n))
+                                    {
+                                        uint64_t current = global_min_n.load(std::memory_order_relaxed);
+                                        while (n < current &&
+                                               !global_min_n.compare_exchange_weak(current, n, std::memory_order_relaxed))
+                                        {
+                                        }
+                                    }
+                                }
+                                ++j;
+                            }
+                            else
+                            {
+                                j += i + 1;
+                            }
+                        }
+                    }
+                }
+#endif
 
                 if (W_search >= K)
                 {
                     for (uint32_t i = 0; i < K; ++i)
                         acc[i] = acc[W_search - K + i];
-                    j -= (W_search - K);
                     overlap = K;
                 }
                 else
@@ -822,6 +1151,12 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
                     overlap = W_search;
                 }
             }
+
+            if (PHASE_PROF)
+                g_ns_sweep.fetch_add((uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                         std::chrono::steady_clock::now() - tp_sweep)
+                                         .count(),
+                                     std::memory_order_relaxed);
 
             static std::atomic<bool> is_writing{false};
             if (!g_worker_mode && chunk_id > NUM_THREADS && chunk_id % 32 == 0)
@@ -861,6 +1196,14 @@ uint64_t solve_impl(uint64_t start_L, uint64_t CHUNK_SIZE)
     for (auto &t : threads)
         t.join();
 
+    if (PHASE_PROF)
+    {
+        double tp = g_ns_pop.load() * 1e-9, ts = g_ns_sweep.load() * 1e-9;
+        std::cout << "\n[prof] thread-summed seconds: population " << std::fixed << std::setprecision(2)
+                  << tp << " (" << std::setprecision(1) << (100.0 * tp / std::max(tp + ts, 1e-9))
+                  << "%) | sweep " << std::setprecision(2) << ts << "\n";
+    }
+
     return global_min_n.load();
 }
 
@@ -878,19 +1221,27 @@ uint64_t solve(uint64_t k, uint64_t start_L)
 #endif
     extend_primes(std::max<uint64_t>(need, 1'000'000));
 
-    // Runtime chunk size: small while few primes per chunk, big once the
-    // per-prime setup dominates (measured crossover ~ k=14).
+    // Runtime chunk size: climb the ladder as the per-chunk prime set grows,
+    // but never past 2^27 - see the CHUNK_SWITCH_P block for the measurements.
+    // CHUNK_LOG forces a size for A/B; sizes above the config's CHUNK_MAX
+    // (ACC16 tops out at 2^27-65536) clamp.
 #ifdef BENCHMARK
     double est_p = std::sqrt(2.0 * (double)(start_L + BENCH_CANDS));
 #else
     double est_p = std::sqrt(2.0 * (double)start_L);
 #endif
-    uint64_t chunk_size = (est_p >= (double)CHUNK_SWITCH_P) ? CHUNK_MAX : CHUNK_MIN;
+    uint64_t chunk_size = CHUNK_MIN;
+    if (est_p >= (double)CHUNK_SWITCH_P2)
+        chunk_size = std::min<uint64_t>(1ULL << 27, CHUNK_MAX);
+    else if (est_p >= (double)CHUNK_SWITCH_P)
+        chunk_size = std::min<uint64_t>(1ULL << 26, CHUNK_MAX);
     if (const char *e = std::getenv("CHUNK_LOG"))
     {
         int v = std::atoi(e);
-        if (v == 25) chunk_size = CHUNK_MIN;
-        else if (v == 26) chunk_size = CHUNK_MAX;
+        if (v >= 25 && v <= 28)
+            chunk_size = std::min<uint64_t>(1ULL << v, CHUNK_MAX);
+        else
+            std::cerr << "CHUNK_LOG must be 25..28 - ignored\n";
     }
 
     switch (k)
@@ -943,11 +1294,11 @@ uint64_t solve(uint64_t k, uint64_t start_L)
 int main(int argc, char **argv)
 {
     // Worker mode for the multi-host coordinator:  ./binary <k> <start_L> <end_L>
-    // Scans chunks with start in [start_L, end_L); the coordinator issues
-    // ranges that are multiples of CHUNK_MAX anchored at the k-start, so the
-    // union of all workers reproduces exactly the single-machine chunk
-    // sequence (including the K-overlap between adjacent chunks/ranges).
-    // Prints "RESULT <k> <min-or-0>" and exits. No checkpoint/results files.
+    // Scans chunks with start in [start_L, end_L), clamping the final chunk to
+    // end_L, so this job owns exactly the candidates [start_L+K, end_L+K)
+    // whatever the chunk size - the union of all ranges tiles the search with
+    // no gap or overlap. Prints "RESULT <k> <min-or-0>" and exits. No
+    // checkpoint/results files.
     if (argc == 4)
     {
         g_worker_mode = true;
@@ -972,11 +1323,25 @@ int main(int argc, char **argv)
 #ifdef BENCHMARK
     std::vector<std::pair<uint64_t, uint64_t>> tests{
         {11, 1'000'000'000'000ULL},   {12, 5'000'000'000'000ULL},     {13, 18'000'000'000'000ULL},
-        {14, 359'000'000'000'000ULL}, {15, 2'880'000'000'000'000ULL},
+        {14, 359'000'000'000'000ULL}, {15, 2'000'000'000'000'000ULL}, {16, 16'000'000'000'000'000ULL},
     };
+    // ONLY_K=<k> restricts the run to one test - the autotuner (tune.py) uses
+    // it to sweep a single k cheaply. ERDOS_TUNE=1 additionally emits one
+    // machine-readable line per test so the tuner can map a measured best
+    // chunk back onto a CHUNK_SWITCH_P threshold without re-deriving est_p.
+    if (const char *e = std::getenv("ONLY_K"))
+    {
+        uint64_t want = std::strtoull(e, nullptr, 10);
+        std::erase_if(tests, [want](const auto &t) { return t.first != want; });
+    }
+    const bool tune_out = std::getenv("ERDOS_TUNE") != nullptr;
     for (const auto &[k, start_L] : tests)
     {
         uint64_t total_candidates = BENCH_CANDS;
+        if (tune_out)
+            std::cout << "TUNE k=" << k << " est_p="
+                      << (uint64_t)std::sqrt(2.0 * (double)(start_L + BENCH_CANDS))
+                      << " blocksz=" << (uint64_t)OPT_BLOCK_SIZE << "\n";
 
         std::cout << "--- BENCHMARK MODE ---\n";
         std::cout << "Testing k=" << k << " | Workload: " << total_candidates / 1000000 << " M candidates\n\n";

@@ -31,7 +31,11 @@ import sys
 import threading
 import time
 
-CHUNK_MAX = 1 << 26  # ranges must be multiples of this (see worker-mode notes)
+# Range granularity floor. Workers clamp their final chunk to the range end,
+# so ranges no longer need to be multiples of the solver's chunk size - this
+# just keeps job sizes round and comfortably larger than any chunk (the CPU
+# solver uses up to 2^28-65536, the GPU solver up to 2^29).
+CHUNK_MAX = 1 << 26
 CONFIG = sys.argv[1] if len(sys.argv) > 1 else "coord-config.json"
 STATE = "coord-state.json"
 RESULTS = "results-396-dist.txt"

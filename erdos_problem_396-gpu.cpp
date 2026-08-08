@@ -6,15 +6,17 @@
 // hand-declared loader, so no OpenCL headers or link-time dependency are
 // needed to build it.
 //
-// Per chunk: k_zero clears the u8 global accumulator (4 bytes per u32 word,
-// bucket-prime mass only); k_pprep computes per-prime first hits + chunk-wide
-// Kummer skips; k_pop_slice runs once per slice (GPU_SLICE_LOG, default 2^23
-// candidates = 8 MB) so bucket-hit atomics stay cache-resident; k_bighits
-// adds host-enumerated big prime-power hits; k_fused does init + small-prime
-// strides + threshold per 16384-candidate segment entirely in SLM; k_runs
-// scans mask bytes for runs of K+1 and appends survivor positions. Survivors
-// are verified on the CPU with the exact oracle, so reported minima are
-// exact.
+// Per chunk: the bin counters are zeroed; k_scatter walks each prime once
+// (chunk-wide Kummer skip, then one 4-byte record per hit into the hit
+// segment's bin - records past the bin capacity are dropped and the needed
+// capacity lands in a per-chunk overflow word, which the host answers by
+// resubmitting the chunk with a larger capacity); k_fused does init +
+// small-prime strides (magic-multiply segment alignment, no hardware
+// division) + bin/big-power drain + threshold per 16384-candidate segment
+// entirely in SLM and emits a bit-packed mask (1 bit per candidate); k_runs
+// finds runs of K+1 set bits word-parallel and appends survivor positions.
+// There is no global accumulator. Survivors are verified on the CPU with the
+// exact oracle, so reported minima are exact.
 //
 // Chunks run through a depth-2 software pipeline over two command queues:
 // while the in-order compute queue executes chunk i, the transfer queue
@@ -24,8 +26,16 @@
 // ERDOS_PROF=1 prints per-chunk per-kernel timings (implies serial so the
 // per-stage numbers stay meaningful).
 //
+// Runtime knobs: GPU_CHUNK_LOG=27..29 (chunk size, default 2^28),
+// GPU_DEVICE=<idx> (device selection for multi-GPU boxes), GPU_PIPELINE,
+// GPU_BIN_HEADROOM, ERDOS_PROF, ERDOS_KERNELS=<path>.
+//
+// MAXP must stay above sqrt(2R) for the deepest k searched: k=17 needs
+// ~5.5e8, so the old 5e8 default would abort mid-run ("Prime table
+// exhausted"). The table only grows on demand, so the higher cap is free
+// until a solve actually needs it.
 #ifndef MAXP
-#define MAXP 500'000'000
+#define MAXP 2'000'000'000
 #endif
 #ifndef KMAX
 #define KMAX 20
@@ -88,7 +98,10 @@ static bool g_pipeline = true;   // overlap transfers/host with compute; env GPU
 static double g_bin_head = 2.0;  // bin capacity = head * mean records/segment; env GPU_BIN_HEADROOM
 static bool g_worker_mode = false;
 static uint64_t g_end_L = UINT64_MAX;
-constexpr uint64_t BIGPOW_CAP = 1'000'000'000'000'000'000ULL;
+// Big prime powers must be enumerated all the way to the range ceiling: a cap
+// below R silently drops the mass of q in (cap, R], which is a false-negative
+// hazard (the old fixed 1e18 cap was fine only because RANGE_CEIL < 1e18).
+constexpr uint64_t BIGPOW_CAP = RANGE_CEIL;
 
 struct PrimeData
 {
@@ -173,12 +186,11 @@ struct alignas(64) AlignedAtomic
 };
 
 std::vector<PrimeData> primes;
-// Population-hot fields split out of the 32-byte PrimeData (which stays for
-// exact_check): sequential 21 B/prime streams instead of 32 B with dead weight.
+// Device-upload fields split out of the 32-byte PrimeData (which stays for
+// exact_check): four coalesced per-prime streams for k_scatter.
 std::vector<uint32_t> pop_p;
 std::vector<uint64_t> pop_magic;
 std::vector<uint8_t> pop_shift;
-std::vector<uint64_t> pop_item; // (min(p,STRIDE_MASK) << STRIDE_SHIFT) | (LOG(p) << LG_SHIFT)
 std::vector<uint16_t> pop_lg;   // LOG(p) for the GPU kernels
 std::vector<Strider> small_striders;
 std::vector<BigPower> big_powers;
@@ -239,7 +251,6 @@ void emit_prime(uint32_t p)
     pop_p.push_back(p);
     pop_magic.push_back((uint64_t)magic_128);
     pop_shift.push_back(shift);
-    pop_item.push_back((std::min<uint64_t>(p, STRIDE_MASK) << STRIDE_SHIFT) | ((uint64_t)log2s << LG_SHIFT));
     pop_lg.push_back(log2s);
 
     if (p > 2 && p <= OPT_BLOCK_SIZE)
@@ -484,13 +495,18 @@ bool exact_check(uint64_t n)
 // ===========================================================================
 // GPU/simulation backend (v2: fused SLM segment kernel)
 // ===========================================================================
+// Default chunk 2^28: the per-chunk full prime-table rescan in k_scatter is
+// the dominant *scaling* cost (pi(sqrt(2R))/CHUNK per candidate ~ 2.8x per k),
+// and doubling the chunk halves it. Runtime override: GPU_CHUNK_LOG=27..29
+// (29 doubles bins to ~2.2 GB - check the device's max allocation).
 #ifndef GPU_CHUNK
-#define GPU_CHUNK (1ULL << 27)
+#define GPU_CHUNK (1ULL << 28)
 #endif
 #ifndef SURV_CAP
 #define SURV_CAP (1u << 20)
 #endif
 #define FUSED_LSZ 256
+static uint64_t g_gpu_chunk = GPU_CHUNK;
 
 #ifdef CPU_SIM
 #include "erdos_396_kernels.cl"
@@ -587,8 +603,8 @@ struct Prof
     bool on = false;
     double t[8] = {};
     uint64_t chunks = 0;
-    static constexpr const char *names[8] = {"host-prep", "upload", "k_zero", "k_pop",
-                                             "k_bighits", "k_fused", "k_runs", "readback"};
+    static constexpr const char *names[8] = {"host-prep", "upload", "fill", "k_scatter",
+                                             "redo", "k_fused", "k_runs", "readback"};
     void report()
     {
         if (!on || !chunks) return;
@@ -614,13 +630,32 @@ static double now_s()
 struct GpuCtx
 {
     std::vector<uint32_t> surv_host;
-    std::vector<uint8_t> mask_hostbuf;
+    std::vector<uint32_t> mask_hostbuf; // bit-packed, 1 bit per candidate
+    uint32_t bin_floor = 0;             // sticky raised bin capacity after an overflow
+
+    // capacity = headroom * mean records per segment; mean via Mertens:
+    // sum(1/p, OPT_BLOCK..max_p) ~ lnln(max_p) - lnln(OPT_BLOCK).
+    // Shared by the device and sim paths so overflow-fallback coverage is
+    // identical in validation.
+    uint32_t bin_cap_for(uint32_t total_idx, uint32_t first_idx, uint32_t W, uint32_t nseg2)
+    {
+        uint32_t cap = 64;
+        if (total_idx > first_idx && nseg2)
+        {
+            double max_p = (double)pop_p[total_idx - 1];
+            double dens = std::log(std::log(max_p)) - std::log(std::log((double)OPT_BLOCK_SIZE));
+            if (dens < 0)
+                dens = 0;
+            cap = (uint32_t)(g_bin_head * dens * (double)W / nseg2) + 256;
+            cap = (cap + 63) & ~63u;
+        }
+        return std::max(cap, bin_floor);
+    }
 
 #ifdef CPU_SIM
-    std::vector<uint32_t> accp;
     std::vector<uint32_t> bins;
     std::vector<uint32_t> bcnt;
-    std::vector<uint8_t> mask;
+    std::vector<uint32_t> mask;
     std::vector<uint32_t> lacc;
 
     void init_device() { std::cout << "[CPU_SIM] kernels run single-threaded on the host\n"; }
@@ -630,16 +665,17 @@ struct GpuCtx
     std::vector<uint32_t> sim_surv; bool sim_ovf = false;
     void submit_chunk(int si, uint64_t L, uint64_t R, uint32_t W, uint32_t nseg,
                       const std::vector<uint32_t> &act_q, const std::vector<uint32_t> &act_off,
-                      const std::vector<uint32_t> &act_lg, const std::vector<uint32_t> &bh_off,
-                      const std::vector<uint32_t> &bh_lg, const std::vector<uint32_t> &Tseg,
+                      const std::vector<uint32_t> &act_lg, const std::vector<uint64_t> &act_magic,
+                      const std::vector<uint8_t> &act_shift, const std::vector<uint32_t> &bh_start,
+                      const std::vector<uint32_t> &bh_rec, const std::vector<uint32_t> &Tseg,
                       const std::vector<uint32_t> &ph_tz, const std::vector<uint32_t> &ph1,
                       const std::vector<uint32_t> &ph2, uint32_t first_idx, uint32_t kummer_idx,
                       uint32_t total_idx, uint32_t Kk)
     {
         (void)si;
         sim_L = L; sim_W = W;
-        run_chunk(L, R, W, nseg, act_q, act_off, act_lg, bh_off, bh_lg, Tseg, ph_tz, ph1, ph2,
-                  first_idx, kummer_idx, total_idx, Kk, sim_surv, sim_ovf);
+        run_chunk(L, R, W, nseg, act_q, act_off, act_lg, act_magic, act_shift, bh_start, bh_rec,
+                  Tseg, ph_tz, ph1, ph2, first_idx, kummer_idx, total_idx, Kk, sim_surv, sim_ovf);
     }
     void finish_chunk(int si, std::vector<uint32_t> &surv, bool &overflow)
     {
@@ -651,43 +687,40 @@ struct GpuCtx
     }
     void run_chunk(uint64_t L, uint64_t R, uint32_t W, uint32_t nseg,
                    const std::vector<uint32_t> &act_q, const std::vector<uint32_t> &act_off,
-                   const std::vector<uint32_t> &act_lg, const std::vector<uint32_t> &bh_off,
-                   const std::vector<uint32_t> &bh_lg, const std::vector<uint32_t> &Tseg,
+                   const std::vector<uint32_t> &act_lg, const std::vector<uint64_t> &act_magic,
+                   const std::vector<uint8_t> &act_shift, const std::vector<uint32_t> &bh_start,
+                   const std::vector<uint32_t> &bh_rec, const std::vector<uint32_t> &Tseg,
                    const std::vector<uint32_t> &ph_tz, const std::vector<uint32_t> &ph1,
                    const std::vector<uint32_t> &ph2, uint32_t first_idx, uint32_t kummer_idx,
                    uint32_t total_idx, uint32_t Kk, std::vector<uint32_t> &surv,
                    bool &overflow)
     {
-        uint32_t np4 = (W + 3) / 4;
-        accp.assign(np4, 0);
-        mask.resize(W);
+        mask.assign((W + 31) / 32, 0);
         lacc.resize(SEG_WORDS);
         auto RUN = [](uint64_t n, auto fn) {
             for (uint64_t g = 0; g < n; ++g) { g_sim_gid = (uint)g; fn(); }
         };
         uint32_t nseg2 = (W + SEG_SIZE - 1) / SEG_SIZE;
-        // capacity model mirrors the GPU path (kept intentionally identical
-        // so overflow-fallback coverage is the same in validation)
-        uint32_t bin_cap = 64;
-        if (total_idx > first_idx && nseg2)
+        // scatter with the shared capacity model; on overflow raise the sticky
+        // floor and re-run, exactly like the device path's chunk resubmit
+        uint32_t bin_cap = bin_cap_for(total_idx, first_idx, W, nseg2);
+        while (true)
         {
-            double max_p = (double)pop_p[total_idx - 1];
-            double dens = std::log(std::log(max_p)) - std::log(std::log((double)OPT_BLOCK_SIZE));
-            if (dens < 0)
-                dens = 0;
-            bin_cap = (uint32_t)(g_bin_head * dens * (double)W / nseg2) + 256;
-            bin_cap = (bin_cap + 63) & ~63u;
+            bins.assign((size_t)nseg2 * bin_cap, 0);
+            bcnt.assign(nseg2, 0);
+            uint32_t ovf = 0;
+            if (total_idx > first_idx)
+                RUN(total_idx - first_idx, [&] { k_scatter(bins.data(), bcnt.data(), &ovf,
+                                                           pop_p.data(), pop_magic.data(), pop_shift.data(),
+                                                           pop_lg.data(), first_idx, kummer_idx, total_idx,
+                                                           L, 2 * R, W, bin_cap); });
+            if (ovf <= bin_cap)
+                break;
+            bin_floor = (std::max(ovf, bin_cap * 2) + 63) & ~63u;
+            std::cerr << "[sim] bin overflow (need " << ovf << " > cap " << bin_cap
+                      << "): re-running chunk with cap " << bin_floor << "\n";
+            bin_cap = bin_floor;
         }
-        bins.assign((size_t)nseg2 * bin_cap, 0);
-        bcnt.assign(nseg2, 0);
-        if (total_idx > first_idx)
-            RUN(total_idx - first_idx, [&] { k_scatter(bins.data(), bcnt.data(), accp.data(),
-                                                       pop_p.data(), pop_magic.data(), pop_shift.data(),
-                                                       pop_lg.data(), first_idx, kummer_idx, total_idx,
-                                                       L, 2 * R, W, bin_cap); });
-        if (!bh_off.empty())
-            RUN(bh_off.size(),
-                [&] { k_bighits(accp.data(), bh_off.data(), bh_lg.data(), (uint32_t)bh_off.size()); });
         // fused segment kernel: phases are lane-parallel, so lid=0/lsz=1 covers
         // a whole segment per call (barrier-equivalent: phases run in order)
         for (uint32_t grp = 0; grp < nseg; ++grp)
@@ -695,9 +728,10 @@ struct GpuCtx
             phase_init(lacc.data(), 0, 1, grp, tz_pat.data(), presieve_pat.data(),
                        presieve2_pat.data(), ph_tz.data(), ph1.data(), ph2.data(), L, W);
             phase_strides(lacc.data(), 0, 1, grp, act_q.data(), act_off.data(), act_lg.data(),
-                          (uint32_t)act_q.size(), W);
-            phase_drain(lacc.data(), 0, 1, grp, bins.data(), bcnt.data(), bin_cap);
-            phase_mask(lacc.data(), 0, 1, grp, accp.data(), mask.data(), Tseg.data(), W);
+                          act_magic.data(), act_shift.data(), (uint32_t)act_q.size(), W);
+            phase_drain(lacc.data(), 0, 1, grp, bins.data(), bcnt.data(), bin_cap,
+                        bh_start.data(), bh_rec.data());
+            phase_mask(lacc.data(), 0, 1, grp, mask.data(), Tseg.data(), W);
         }
         uint32_t cnt = 0;
         surv.assign(SURV_CAP, 0);
@@ -706,50 +740,39 @@ struct GpuCtx
         else { overflow = false; surv.resize(cnt); }
     }
 
-    const uint8_t *mask_host(int si, uint32_t W) { (void)si; (void)W; return mask.data(); }
+    const uint32_t *mask_host(int si, uint32_t W) { (void)si; (void)W; return mask.data(); }
 #else
     cl_context ctx = nullptr;
     cl_command_queue q = nullptr;  // compute (in-order: cross-chunk hazards on
-                                   // shared bAcc/bPoff/bBins are serialized here)
+                                   // shared bBins/bBcnt are serialized here)
     cl_command_queue qx = nullptr; // transfers: uploads for the next chunk and
                                    // readbacks for the previous one overlap compute
     cl_device_id dev = nullptr;
     cl_program prog = nullptr;
-    cl_kernel kZero, kScatter, kBighits, kFused, kRuns;
+    cl_kernel kZero, kScatter, kFused, kRuns;
     // per-chunk buffers live in two sets so chunk i+1's uploads and chunk
-    // i-1's readbacks never touch the buffers chunk i's kernels are using
+    // i-1's readbacks never touch the buffers chunk i's kernels are using.
+    // Every scalar a launch needs is stored here too, so the whole kernel
+    // sequence can be re-enqueued for the bin-overflow resubmit.
     struct ChunkSet
     {
-        cl_mem actQ = nullptr, actO = nullptr, actL = nullptr;
-        cl_mem phTz = nullptr, ph1 = nullptr, ph2 = nullptr, tseg = nullptr;
-        cl_mem bhO = nullptr, bhL = nullptr, out = nullptr, outCnt = nullptr, mask = nullptr;
-        size_t capAct = 0, capSeg = 0, capBh = 0, capMask = 0;
+        cl_mem actQ = nullptr, actO = nullptr, actL = nullptr, actM = nullptr, actS = nullptr;
+        cl_mem phTz = nullptr, ph1 = nullptr, ph2 = nullptr, tseg = nullptr, bhS = nullptr;
+        cl_mem bhR = nullptr, out = nullptr, outCnt = nullptr, ovf = nullptr, mask = nullptr;
+        size_t capActN = 0, capSeg = 0, capBhR = 0, capMask = 0;
         cl_event evC = nullptr; // completion of this chunk's last kernel
-        uint64_t L = 0;         // chunk meta for the consume stage
-        uint32_t W = 0, nActs = 0, nBh = 0;
+        uint64_t L = 0, R2 = 0; // chunk meta (consume stage + re-enqueue)
+        uint32_t W = 0, nseg = 0, nActs = 0;
+        uint32_t first_idx = 0, kummer_idx = 0, total_idx = 0, Kk = 0;
+        uint32_t bin_cap_used = 0;
     };
     ChunkSet sets[2];
-    cl_mem bAcc = nullptr, bTz = nullptr, bPat1 = nullptr, bPat2 = nullptr;
+    cl_mem bTz = nullptr, bPat1 = nullptr, bPat2 = nullptr;
 
     cl_mem bPopP = nullptr, bPopM = nullptr, bPopS = nullptr, bPopL = nullptr;
     cl_mem bBins = nullptr, bBcnt = nullptr;
     size_t capBins = 0, capBcnt = 0;
-    uint32_t cur_bin_cap = 0;
-    // capacity = headroom * mean records per segment; mean via Mertens:
-    // sum(1/p, OPT_BLOCK..max_p) ~ lnln(max_p) - lnln(OPT_BLOCK)
-    uint32_t bin_cap_for(uint32_t total_idx, uint32_t first_idx, uint32_t W, uint32_t nseg2)
-    {
-        if (total_idx <= first_idx || nseg2 == 0)
-            return 64;
-        double max_p = (double)pop_p[total_idx - 1];
-        double dens = std::log(std::log(max_p)) - std::log(std::log((double)OPT_BLOCK_SIZE));
-        if (dens < 0)
-            dens = 0;
-        double mean = dens * (double)W / nseg2;
-        uint32_t cap = (uint32_t)(g_bin_head * mean) + 256;
-        return (cap + 63) & ~63u;
-    }
-    size_t capAcc = 0, popCount = 0;
+    size_t popCount = 0;
 
     void ensure(cl_mem &b, size_t &cap, size_t need)
     {
@@ -789,20 +812,40 @@ struct GpuCtx
         cl_platform_id plats[8];
         cl_uint np = 0;
         CLCHECK(CL.GetPlatformIDs(8, plats, &np));
-        for (cl_uint i = 0; i < np && !dev; ++i)
+        // enumerate every GPU across platforms; GPU_DEVICE=<idx> selects one,
+        // so the coordinator scales out by listing the same host once per
+        // device with env: {"GPU_DEVICE": "<idx>"}
+        cl_device_id devs[16];
+        cl_uint ndev = 0;
+        for (cl_uint i = 0; i < np && ndev < 16; ++i)
         {
-            cl_device_id d;
+            cl_device_id d[16];
             cl_uint nd = 0;
-            if (CL.GetDeviceIDs(plats[i], CL_DEVICE_TYPE_GPU, 1, &d, &nd) == CL_SUCCESS && nd > 0)
-                dev = d;
+            if (CL.GetDeviceIDs(plats[i], CL_DEVICE_TYPE_GPU, 16 - ndev, d, &nd) == CL_SUCCESS)
+                for (cl_uint j = 0; j < nd && ndev < 16; ++j)
+                    devs[ndev++] = d[j];
         }
-        if (!dev) { std::cerr << "No OpenCL GPU device found (check clinfo / /dev/dri access)\n"; std::exit(1); }
-        char name[256] = {0};
-        CL.GetDeviceInfo(dev, CL_DEVICE_NAME, sizeof(name), name, nullptr);
-        uint64_t gmem = 0; cl_uint cu = 0;
-        CL.GetDeviceInfo(dev, CL_DEVICE_GLOBAL_MEM_SIZE, 8, &gmem, nullptr);
-        CL.GetDeviceInfo(dev, CL_DEVICE_MAX_COMPUTE_UNITS, 4, &cu, nullptr);
-        std::cout << "GPU: " << name << " | " << (gmem >> 20) << " MiB | " << cu << " CUs\n";
+        if (!ndev) { std::cerr << "No OpenCL GPU device found (check clinfo / /dev/dri access)\n"; std::exit(1); }
+        cl_uint want = 0;
+        if (const char *e = std::getenv("GPU_DEVICE"))
+        {
+            int v = std::atoi(e);
+            if (v >= 0 && (cl_uint)v < ndev)
+                want = (cl_uint)v;
+            else
+                std::cerr << "GPU_DEVICE=" << e << " out of range (0.." << ndev - 1 << "); using 0\n";
+        }
+        dev = devs[want];
+        for (cl_uint j = 0; j < ndev; ++j)
+        {
+            char name[256] = {0};
+            CL.GetDeviceInfo(devs[j], CL_DEVICE_NAME, sizeof(name), name, nullptr);
+            uint64_t gmem = 0; cl_uint cu = 0;
+            CL.GetDeviceInfo(devs[j], CL_DEVICE_GLOBAL_MEM_SIZE, 8, &gmem, nullptr);
+            CL.GetDeviceInfo(devs[j], CL_DEVICE_MAX_COMPUTE_UNITS, 4, &cu, nullptr);
+            std::cout << "GPU[" << j << "]: " << name << " | " << (gmem >> 20) << " MiB | " << cu
+                      << " CUs" << (j == want ? "  (selected)" : "") << "\n";
+        }
         cl_int e;
         ctx = CL.CreateContext(nullptr, 1, &dev, nullptr, nullptr, &e); CLCHECK(e);
         q = CL.CreateCommandQueueWithProperties(ctx, dev, nullptr, &e); CLCHECK(e);
@@ -828,7 +871,6 @@ struct GpuCtx
         }
         kZero = CL.CreateKernel(prog, "k_zero", &e); CLCHECK(e);
         kScatter = CL.CreateKernel(prog, "k_scatter", &e); CLCHECK(e);
-        kBighits = CL.CreateKernel(prog, "k_bighits", &e); CLCHECK(e);
         kFused = CL.CreateKernel(prog, "k_fused", &e); CLCHECK(e);
         kRuns = CL.CreateKernel(prog, "k_runs", &e); CLCHECK(e);
 
@@ -853,149 +895,168 @@ struct GpuCtx
 
     void submit_chunk(int si, uint64_t L, uint64_t R, uint32_t W, uint32_t nseg,
                       const std::vector<uint32_t> &act_q, const std::vector<uint32_t> &act_off,
-                      const std::vector<uint32_t> &act_lg, const std::vector<uint32_t> &bh_off,
-                      const std::vector<uint32_t> &bh_lg, const std::vector<uint32_t> &Tseg,
+                      const std::vector<uint32_t> &act_lg, const std::vector<uint64_t> &act_magic,
+                      const std::vector<uint8_t> &act_shift, const std::vector<uint32_t> &bh_start,
+                      const std::vector<uint32_t> &bh_rec, const std::vector<uint32_t> &Tseg,
                       const std::vector<uint32_t> &ph_tz, const std::vector<uint32_t> &ph1,
                       const std::vector<uint32_t> &ph2, uint32_t first_idx, uint32_t kummer_idx,
                       uint32_t total_idx, uint32_t Kk)
     {
         double t0 = now_s();
         ChunkSet &cs = sets[si];
-        cs.L = L; cs.W = W; cs.nActs = (uint32_t)act_q.size(); cs.nBh = (uint32_t)bh_off.size();
-        uint32_t np4 = (W + 3) / 4;
-        ensure(bAcc, capAcc, (size_t)np4 * 4);
-        ensure(cs.mask, cs.capMask, (size_t)W);
+        cs.L = L; cs.R2 = 2 * R; cs.W = W; cs.nseg = nseg;
+        cs.nActs = (uint32_t)act_q.size();
+        cs.first_idx = first_idx; cs.kummer_idx = kummer_idx; cs.total_idx = total_idx; cs.Kk = Kk;
+        cs.bin_cap_used = bin_cap_for(total_idx, first_idx, W, nseg);
+        ensure(cs.mask, cs.capMask, (size_t)((W + 31) / 32) * 4);
         {
             size_t c0 = 0;
             if (!cs.out) ensure(cs.out, c0, (size_t)SURV_CAP * 4);
             c0 = 0;
             if (!cs.outCnt) ensure(cs.outCnt, c0, 4);
+            c0 = 0;
+            if (!cs.ovf) ensure(cs.ovf, c0, 4);
         }
         size_t segb = (size_t)nseg * 4;
         if (segb > cs.capSeg)
         {
             size_t c;
-            if (cs.phTz) { CL.ReleaseMemObject(cs.phTz); CL.ReleaseMemObject(cs.ph1); CL.ReleaseMemObject(cs.ph2); CL.ReleaseMemObject(cs.tseg); cs.phTz = cs.ph1 = cs.ph2 = cs.tseg = nullptr; }
+            if (cs.phTz) { CL.ReleaseMemObject(cs.phTz); CL.ReleaseMemObject(cs.ph1); CL.ReleaseMemObject(cs.ph2); CL.ReleaseMemObject(cs.tseg); CL.ReleaseMemObject(cs.bhS); cs.phTz = cs.ph1 = cs.ph2 = cs.tseg = cs.bhS = nullptr; }
             c = 0; ensure(cs.phTz, c, segb); c = 0; ensure(cs.ph1, c, segb);
             c = 0; ensure(cs.ph2, c, segb); c = 0; ensure(cs.tseg, c, segb);
+            c = 0; ensure(cs.bhS, c, segb + 4); // CSR bounds: nseg+1 entries
             cs.capSeg = segb;
         }
         up(cs.phTz, ph_tz.data(), segb); up(cs.ph1, ph1.data(), segb);
         up(cs.ph2, ph2.data(), segb); up(cs.tseg, Tseg.data(), segb);
-        size_t actb = act_q.size() * 4;
-        if (actb > cs.capAct)
+        up(cs.bhS, bh_start.data(), segb + 4);
+        size_t nAct = act_q.size();
+        if (nAct > cs.capActN)
         {
             size_t c;
-            if (cs.actQ) { CL.ReleaseMemObject(cs.actQ); CL.ReleaseMemObject(cs.actO); CL.ReleaseMemObject(cs.actL); cs.actQ = cs.actO = cs.actL = nullptr; }
-            c = 0; ensure(cs.actQ, c, actb ? actb : 4); c = 0; ensure(cs.actO, c, actb ? actb : 4); c = 0; ensure(cs.actL, c, actb ? actb : 4);
-            cs.capAct = actb ? actb : 4;
+            if (cs.actQ) { CL.ReleaseMemObject(cs.actQ); CL.ReleaseMemObject(cs.actO); CL.ReleaseMemObject(cs.actL); CL.ReleaseMemObject(cs.actM); CL.ReleaseMemObject(cs.actS); cs.actQ = cs.actO = cs.actL = cs.actM = cs.actS = nullptr; }
+            size_t n = nAct ? nAct : 1;
+            c = 0; ensure(cs.actQ, c, n * 4); c = 0; ensure(cs.actO, c, n * 4);
+            c = 0; ensure(cs.actL, c, n * 4); c = 0; ensure(cs.actM, c, n * 8);
+            c = 0; ensure(cs.actS, c, n);
+            cs.capActN = n;
         }
-        if (actb) { up(cs.actQ, act_q.data(), actb); up(cs.actO, act_off.data(), actb); up(cs.actL, act_lg.data(), actb); }
-        size_t bhb = bh_off.size() * 4;
-        if (bhb > cs.capBh)
+        if (nAct)
         {
-            size_t c;
-            if (cs.bhO) { CL.ReleaseMemObject(cs.bhO); CL.ReleaseMemObject(cs.bhL); cs.bhO = cs.bhL = nullptr; }
-            c = 0; ensure(cs.bhO, c, bhb); c = 0; ensure(cs.bhL, c, bhb);
-            cs.capBh = bhb;
+            up(cs.actQ, act_q.data(), nAct * 4); up(cs.actO, act_off.data(), nAct * 4);
+            up(cs.actL, act_lg.data(), nAct * 4); up(cs.actM, act_magic.data(), nAct * 8);
+            up(cs.actS, act_shift.data(), nAct);
         }
-        if (bhb) { up(cs.bhO, bh_off.data(), bhb); up(cs.bhL, bh_lg.data(), bhb); }
+        size_t bhb = bh_rec.size() * 4;
+        if (bhb > cs.capBhR)
+        {
+            if (cs.bhR) { CL.ReleaseMemObject(cs.bhR); cs.bhR = nullptr; }
+            size_t c = 0; ensure(cs.bhR, c, bhb ? bhb : 4);
+            cs.capBhR = bhb ? bhb : 4;
+        }
+        if (bhb) up(cs.bhR, bh_rec.data(), bhb);
+        prof_mark(1, t0);
+        enqueue_kernels(si);
+        CLCHECK(CL.Flush(q));
+    }
+
+    // (Re-)enqueue the whole kernel sequence for a prepared chunk set: zero
+    // the bin counters + outCnt/ovf, then k_scatter -> k_fused -> k_runs.
+    // Used by submit_chunk and by the bin-overflow resubmit in finish_chunk;
+    // everything a launch needs lives in the ChunkSet. The in-order compute
+    // queue serializes the shared bBins/bBcnt against whatever is in flight.
+    void enqueue_kernels(int si)
+    {
+        double t0 = now_s();
+        ChunkSet &cs = sets[si];
         uint32_t zero = 0;
         up(cs.outCnt, &zero, 4);
-        prof_mark(1, t0);
-
+        up(cs.ovf, &zero, 4);
+        uint32_t bin_cap = cs.bin_cap_used;
+        size_t needB = (size_t)cs.nseg * bin_cap * 4;
+        if (needB > capBins)
+        {
+            if (bBins) { CL.ReleaseMemObject(bBins); bBins = nullptr; }
+            size_t c = 0; ensure(bBins, c, needB); capBins = needB;
+        }
+        size_t needC = (size_t)cs.nseg * 4;
+        if (needC > capBcnt)
+        {
+            if (bBcnt) { CL.ReleaseMemObject(bBcnt); bBcnt = nullptr; }
+            size_t c = 0; ensure(bBcnt, c, needC); capBcnt = needC;
+        }
         if (CL.EnqueueFillBuffer)
         {
             uint32_t z = 0;
-            CLCHECK(CL.EnqueueFillBuffer(q, bAcc, &z, 4, 0, (size_t)np4 * 4, 0, nullptr, nullptr));
+            CLCHECK(CL.EnqueueFillBuffer(q, bBcnt, &z, 4, 0, needC, 0, nullptr, nullptr));
         }
         else
         {
-            arg(kZero, 0, bAcc); arg(kZero, 1, np4);
-            launch(kZero, ((size_t)np4 + 255) / 256 * 256);
+            arg(kZero, 0, bBcnt); arg(kZero, 1, cs.nseg);
+            launch(kZero, ((size_t)cs.nseg + 255) / 256 * 256);
         }
         prof_mark(2, t0);
 
-        uint32_t nseg2 = (W + 16383) / 16384; // one bin per 16384-candidate segment
-        uint32_t bin_cap = this->bin_cap_for(total_idx, first_idx, W, nseg2);
+        if (cs.total_idx > cs.first_idx)
         {
-            size_t needB = (size_t)nseg2 * bin_cap * 4;
-            if (needB > capBins)
-            {
-                if (bBins) { CL.ReleaseMemObject(bBins); bBins = nullptr; }
-                size_t c = 0; ensure(bBins, c, needB); capBins = needB;
-            }
-            size_t needC = (size_t)nseg2 * 4;
-            if (needC > capBcnt)
-            {
-                if (bBcnt) { CL.ReleaseMemObject(bBcnt); bBcnt = nullptr; }
-                size_t c = 0; ensure(bBcnt, c, needC); capBcnt = needC;
-            }
-            if (CL.EnqueueFillBuffer)
-            {
-                uint32_t z = 0;
-                CLCHECK(CL.EnqueueFillBuffer(q, bBcnt, &z, 4, 0, needC, 0, nullptr, nullptr));
-            }
-            else
-            {
-                arg(kZero, 0, bBcnt); arg(kZero, 1, nseg2);
-                launch(kZero, ((size_t)nseg2 + 255) / 256 * 256);
-            }
-        }
-        if (total_idx > first_idx)
-        {
-            uint64_t R2 = 2 * R;
-            arg(kScatter, 0, bBins); arg(kScatter, 1, bBcnt); arg(kScatter, 2, bAcc);
+            arg(kScatter, 0, bBins); arg(kScatter, 1, bBcnt); arg(kScatter, 2, cs.ovf);
             arg(kScatter, 3, bPopP); arg(kScatter, 4, bPopM); arg(kScatter, 5, bPopS); arg(kScatter, 6, bPopL);
-            arg(kScatter, 7, first_idx); arg(kScatter, 8, kummer_idx); arg(kScatter, 9, total_idx);
-            arg(kScatter, 10, L); arg(kScatter, 11, R2); arg(kScatter, 12, W); arg(kScatter, 13, bin_cap);
-            launch(kScatter, total_idx - first_idx);
+            arg(kScatter, 7, cs.first_idx); arg(kScatter, 8, cs.kummer_idx); arg(kScatter, 9, cs.total_idx);
+            arg(kScatter, 10, cs.L); arg(kScatter, 11, cs.R2); arg(kScatter, 12, cs.W); arg(kScatter, 13, bin_cap);
+            launch(kScatter, cs.total_idx - cs.first_idx);
         }
-        cur_bin_cap = bin_cap;
         prof_mark(3, t0);
 
-        if (!bh_off.empty())
-        {
-            uint32_t nb = (uint32_t)bh_off.size();
-            arg(kBighits, 0, bAcc); arg(kBighits, 1, cs.bhO); arg(kBighits, 2, cs.bhL); arg(kBighits, 3, nb);
-            launch(kBighits, nb);
-        }
-        prof_mark(4, t0);
-
-        {
-            uint32_t na = (uint32_t)act_q.size();
-            arg(kFused, 0, bAcc); arg(kFused, 1, cs.mask);
-            arg(kFused, 2, bTz); arg(kFused, 3, bPat1); arg(kFused, 4, bPat2);
-            arg(kFused, 5, cs.phTz); arg(kFused, 6, cs.ph1); arg(kFused, 7, cs.ph2);
-            arg(kFused, 8, cs.tseg); arg(kFused, 9, cs.actQ); arg(kFused, 10, cs.actO); arg(kFused, 11, cs.actL);
-            arg(kFused, 12, bBins); arg(kFused, 13, bBcnt); arg(kFused, 14, cur_bin_cap);
-            arg(kFused, 15, na); arg(kFused, 16, L); arg(kFused, 17, W);
-            launch(kFused, (size_t)nseg * FUSED_LSZ, FUSED_LSZ);
-        }
+        arg(kFused, 0, cs.mask);
+        arg(kFused, 1, bTz); arg(kFused, 2, bPat1); arg(kFused, 3, bPat2);
+        arg(kFused, 4, cs.phTz); arg(kFused, 5, cs.ph1); arg(kFused, 6, cs.ph2);
+        arg(kFused, 7, cs.tseg); arg(kFused, 8, cs.actQ); arg(kFused, 9, cs.actO); arg(kFused, 10, cs.actL);
+        arg(kFused, 11, cs.actM); arg(kFused, 12, cs.actS);
+        arg(kFused, 13, bBins); arg(kFused, 14, bBcnt); arg(kFused, 15, bin_cap);
+        arg(kFused, 16, cs.bhS); arg(kFused, 17, cs.bhR);
+        arg(kFused, 18, cs.nActs); arg(kFused, 19, cs.L); arg(kFused, 20, cs.W);
+        launch(kFused, (size_t)cs.nseg * FUSED_LSZ, FUSED_LSZ);
         prof_mark(5, t0);
 
         uint32_t cap = SURV_CAP;
         arg(kRuns, 0, cs.mask); arg(kRuns, 1, cs.out); arg(kRuns, 2, cs.outCnt);
-        arg(kRuns, 3, Kk); arg(kRuns, 4, W); arg(kRuns, 5, cap);
-        launch(kRuns, ((size_t)(W + 31) / 32 + 255) / 256 * 256, 0, &cs.evC);
-        if (g_prof.on)
-        {
-            CLCHECK(CL.Finish(q));
-            double t1 = now_s();
-            g_prof.t[6] += t1 - t0;
-            t0 = t1;
-        }
-        CLCHECK(CL.Flush(q));
+        arg(kRuns, 3, cs.Kk); arg(kRuns, 4, cs.W); arg(kRuns, 5, cap);
+        if (cs.evC) { CL.ReleaseEvent(cs.evC); cs.evC = nullptr; }
+        launch(kRuns, ((size_t)(cs.W + 31) / 32 + 255) / 256 * 256, 0, &cs.evC);
+        prof_mark(6, t0);
     }
 
     void finish_chunk(int si, std::vector<uint32_t> &surv, bool &overflow)
     {
         double t0 = now_s();
         ChunkSet &cs = sets[si];
-        uint32_t cnt = 0;
-        CLCHECK(CL.EnqueueReadBuffer(qx, cs.outCnt, CL_TRUE, 0, 4, &cnt, 1, (const void *)&cs.evC, nullptr));
+        // wait for the chunk's last kernel, then check for dropped bin records
+        uint32_t need = 0;
+        CLCHECK(CL.EnqueueReadBuffer(qx, cs.ovf, CL_TRUE, 0, 4, &need, 1, (const void *)&cs.evC, nullptr));
+        int redos = 0;
+        while (need > cs.bin_cap_used)
+        {
+            // k_scatter dropped records: raise the sticky capacity floor and
+            // re-run the whole chunk - costs one duplicate chunk, never
+            // correctness. Loud on purpose: frequent hits mean the density
+            // model needs retuning (GPU_BIN_HEADROOM).
+            bin_floor = (std::max(need, cs.bin_cap_used * 2) + 63) & ~63u;
+            std::cerr << "\n[gpu] bin overflow (need " << need << " > cap " << cs.bin_cap_used
+                      << "): resubmitting chunk with cap " << bin_floor << "\n";
+            cs.bin_cap_used = bin_floor;
+            double tr = now_s();
+            enqueue_kernels(si);
+            CLCHECK(CL.Flush(q));
+            need = 0;
+            CLCHECK(CL.EnqueueReadBuffer(qx, cs.ovf, CL_TRUE, 0, 4, &need, 1, (const void *)&cs.evC, nullptr));
+            if (g_prof.on)
+                g_prof.t[4] += now_s() - tr;
+            if (++redos > 40) { std::cerr << "bin overflow not converging\n"; std::exit(1); }
+        }
         CL.ReleaseEvent(cs.evC);
         cs.evC = nullptr;
+        uint32_t cnt = 0;
+        CLCHECK(CL.EnqueueReadBuffer(qx, cs.outCnt, CL_TRUE, 0, 4, &cnt, 0, nullptr, nullptr));
         if (cnt >= SURV_CAP) { overflow = true; surv.clear(); }
         else
         {
@@ -1009,10 +1070,11 @@ struct GpuCtx
             ++g_prof.chunks;
     }
 
-    const uint8_t *mask_host(int si, uint32_t W)
+    const uint32_t *mask_host(int si, uint32_t W)
     {
-        mask_hostbuf.resize(W);
-        CLCHECK(CL.EnqueueReadBuffer(qx, sets[si].mask, CL_TRUE, 0, W, mask_hostbuf.data(), 0, nullptr, nullptr));
+        uint32_t nw = (W + 31) / 32;
+        mask_hostbuf.resize(nw);
+        CLCHECK(CL.EnqueueReadBuffer(qx, sets[si].mask, CL_TRUE, 0, (size_t)nw * 4, mask_hostbuf.data(), 0, nullptr, nullptr));
         return mask_hostbuf.data();
     }
 #endif
@@ -1023,19 +1085,28 @@ static GpuCtx g_gpu;
 template <uint64_t K>
 uint64_t solve_impl(uint64_t start_L)
 {
-    const uint64_t CHUNK = GPU_CHUNK;
+    const uint64_t CHUNK = g_gpu_chunk;
     g_gpu.ensure_pop();
 
     uint64_t global_min = UINT64_MAX;
     auto start_time = std::chrono::high_resolution_clock::now();
-    std::vector<uint32_t> act_q, act_off, act_lg, bh_off, bh_lg, Tseg, ph_tz, ph1, ph2, surv;
-    std::vector<std::array<uint32_t, 3>> act_tmp;
+    std::vector<uint32_t> act_q, act_off, act_lg, bh_start, bh_rec, bh_pos, Tseg, ph_tz, ph1, ph2, surv;
+    std::vector<uint64_t> act_magic;
+    std::vector<uint8_t> act_shift;
+    struct ActRec
+    {
+        uint32_t q, off, lg;
+        uint8_t shift;
+        uint64_t magic;
+    };
+    std::vector<ActRec> act_tmp;
+    std::vector<std::pair<uint32_t, uint32_t>> bh_tmp; // (segment, record)
 
     // Software pipeline (depth 2 unless profiling/GPU_PIPELINE=0): while the
     // device computes chunk i, the host preps + uploads chunk i+1 on the
     // transfer queue and consumes chunk i-1's survivors (including the exact
-    // oracle). The in-order compute queue serializes the shared bAcc / bPoff /
-    // bBins across chunks; per-chunk buffers alternate between two sets.
+    // oracle). The in-order compute queue serializes the shared bBins / bBcnt
+    // across chunks; per-chunk buffers alternate between two sets.
 #ifdef CPU_SIM
     const uint64_t depth = 1;
 #else
@@ -1091,7 +1162,9 @@ uint64_t solve_impl(uint64_t start_L)
             size_t kummer_idx = std::distance(primes.begin(), it_thresh);
 
             // active small strided prime powers (identical logic to CPU v9 Phase 1),
-            // sorted by q so neighbouring GPU lanes get equal loop trip counts
+            // sorted by q so neighbouring GPU lanes get equal loop trip counts.
+            // magic/shift ride along so phase_strides aligns to segments with a
+            // mul_hi instead of a hardware division.
             const uint32_t small_cap = (uint32_t)std::min<uint64_t>(max_p, OPT_BLOCK_SIZE);
             act_tmp.clear();
             for (const Strider &st : small_striders)
@@ -1108,29 +1181,41 @@ uint64_t solve_impl(uint64_t start_L)
                 }
                 uint64_t num = L_chunk + st.q - 1;
                 uint64_t start_c = (uint64_t)((((unsigned __int128)num * st.magic) >> 64) >> st.shift);
-                act_tmp.push_back({st.q, (uint32_t)(start_c * st.q - L_chunk), st.log2s});
+                act_tmp.push_back({st.q, (uint32_t)(start_c * st.q - L_chunk), st.log2s, st.shift, st.magic});
             }
             std::sort(act_tmp.begin(), act_tmp.end(),
-                      [](const auto &a, const auto &b) { return a[0] < b[0]; });
-            act_q.clear(); act_off.clear(); act_lg.clear();
+                      [](const ActRec &a, const ActRec &b) { return a.q < b.q; });
+            act_q.clear(); act_off.clear(); act_lg.clear(); act_magic.clear(); act_shift.clear();
             for (const auto &a : act_tmp)
             {
-                act_q.push_back(a[0]);
-                act_off.push_back(a[1]);
-                act_lg.push_back(a[2]);
+                act_q.push_back(a.q);
+                act_off.push_back(a.off);
+                act_lg.push_back(a.lg);
+                act_magic.push_back(a.magic);
+                act_shift.push_back(a.shift);
             }
-            // explicit big-power hits
-            bh_off.clear(); bh_lg.clear();
+            // big prime-power hits, CSR-indexed by segment for phase_drain
+            // (record format matches the bucket bins: (off & 16383) | LOG<<16)
+            bh_tmp.clear();
             for (const auto &bp : big_powers)
             {
                 if (bp.q > R_chunk)
                     break;
                 for (uint64_t m = ((L_chunk + bp.q - 1) / bp.q) * bp.q; m <= R_chunk; m += bp.q)
                 {
-                    bh_off.push_back((uint32_t)(m - L_chunk));
-                    bh_lg.push_back(bp.log2s);
+                    uint32_t off = (uint32_t)(m - L_chunk);
+                    bh_tmp.emplace_back(off >> 14, (off & 16383u) | ((uint32_t)bp.log2s << 16));
                 }
             }
+            bh_start.assign(nseg + 1, 0);
+            for (const auto &pr : bh_tmp)
+                bh_start[pr.first + 1]++;
+            for (uint32_t s = 0; s < nseg; ++s)
+                bh_start[s + 1] += bh_start[s];
+            bh_rec.resize(bh_tmp.size());
+            bh_pos.assign(bh_start.begin(), bh_start.end() - 1);
+            for (const auto &pr : bh_tmp)
+                bh_rec[bh_pos[pr.first]++] = pr.second;
             // per-segment thresholds and table phases
             Tseg.resize(nseg); ph_tz.resize(nseg); ph1.resize(nseg); ph2.resize(nseg);
             for (uint32_t s = 0; s < nseg; ++s)
@@ -1147,8 +1232,9 @@ uint64_t solve_impl(uint64_t start_L)
             metas[issued & 1].L = L_chunk;
             metas[issued & 1].W = W;
             g_gpu.submit_chunk((int)(issued & 1), L_chunk, R_chunk, W, nseg, act_q, act_off, act_lg,
-                               bh_off, bh_lg, Tseg, ph_tz, ph1, ph2, (uint32_t)first_idx,
-                               (uint32_t)kummer_idx, (uint32_t)total_idx, (uint32_t)K);
+                               act_magic, act_shift, bh_start, bh_rec, Tseg, ph_tz, ph1, ph2,
+                               (uint32_t)first_idx, (uint32_t)kummer_idx, (uint32_t)total_idx,
+                               (uint32_t)K);
             ++issued;
         }
         if (consumed == issued)
@@ -1170,11 +1256,12 @@ uint64_t solve_impl(uint64_t start_L)
         }
         else
         {
-            const uint8_t *mask = g_gpu.mask_host(si, W);
+            // SURV_CAP overflow: rescan the bit-packed mask on the host
+            const uint32_t *mask = g_gpu.mask_host(si, W);
             uint32_t run = 0;
             for (uint32_t j = 0; j < W; ++j)
             {
-                run = mask[j] ? run + 1 : 0;
+                run = ((mask[j >> 5] >> (j & 31)) & 1u) ? run + 1 : 0;
                 if (run >= K + 1)
                 {
                     uint64_t n = L_chunk + j;
@@ -1243,6 +1330,26 @@ uint64_t solve(uint64_t k, uint64_t start_L)
     }
 }
 
+static void parse_gpu_env()
+{
+    g_prof.on = std::getenv("ERDOS_PROF") != nullptr;
+    if (const char *e = std::getenv("GPU_PIPELINE"))
+        g_pipeline = std::atoi(e) != 0;
+    if (const char *e = std::getenv("GPU_BIN_HEADROOM"))
+    {
+        double v = std::atof(e);
+        if (v >= 1.2 && v <= 8.0) g_bin_head = v;
+    }
+    if (const char *e = std::getenv("GPU_CHUNK_LOG"))
+    {
+        int v = std::atoi(e);
+        if (v >= 27 && v <= 29)
+            g_gpu_chunk = 1ULL << v;
+        else
+            std::cerr << "GPU_CHUNK_LOG must be 27..29 - ignored\n";
+    }
+}
+
 int main(int argc, char **argv)
 {
     // Worker mode for the multi-host coordinator: ./binary <k> <start_L> <end_L>
@@ -1253,6 +1360,7 @@ int main(int argc, char **argv)
         uint64_t kk = std::strtoull(argv[1], nullptr, 10);
         uint64_t s = std::strtoull(argv[2], nullptr, 10);
         g_end_L = std::strtoull(argv[3], nullptr, 10);
+        parse_gpu_env();
         get_primes(1'000'000);
         g_gpu.init_device();
         uint64_t ans = solve(kk, s);
@@ -1267,21 +1375,15 @@ int main(int argc, char **argv)
               << std::chrono::duration<double>(std::chrono::high_resolution_clock::now() - start_primes).count()
               << " seconds. (" << small_striders.size() << " small strides, " << big_powers.size()
               << " big powers)\n";
-    g_prof.on = std::getenv("ERDOS_PROF") != nullptr;
-    if (const char *e = std::getenv("GPU_PIPELINE"))
-        g_pipeline = std::atoi(e) != 0;
-    if (const char *e = std::getenv("GPU_BIN_HEADROOM"))
-    {
-        double v = std::atof(e);
-        if (v >= 1.2 && v <= 8.0) g_bin_head = v;
-    }
+    parse_gpu_env();
     g_gpu.init_device();
     std::cout << "\n";
 
 #ifdef BENCHMARK
     std::vector<std::pair<uint64_t, uint64_t>> tests{
-        {11, 1'000'000'000'000ULL},   {12, 5'000'000'000'000ULL},     {13, 18'000'000'000'000ULL},
-        {14, 359'000'000'000'000ULL}, {15, 2'880'000'000'000'000ULL},
+        {11, 1'000'000'000'000ULL},   {12, 5'000'000'000'000ULL},      {13, 18'000'000'000'000ULL},
+        {14, 359'000'000'000'000ULL}, {15, 2'880'000'000'000'000ULL},  {16, 16'000'000'000'000'000ULL},
+        {17, 150'000'000'000'000'000ULL}, // still under the 2^59 range ceiling
     };
     for (const auto &[k, start_L] : tests)
     {

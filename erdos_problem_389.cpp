@@ -6,16 +6,17 @@
 // i.e. C(N,m) | C(2N-m,N): a product of m consecutive integers ending at N
 // against a near-central binomial. The search variable is N; k = N - m.
 //
-// Soundness of the sieve (Kummer digit analysis): for a prime p | N-i the
-// digit-0 addition of (N-m) + N in base p carries freely iff 2i >= m, so only
-// run positions i <= K = (m-1)/2 need fully accounted smoothness - those are
-// the positions this sieve scans. For them, a carry at digit >= 1 is possible
-// iff some base-p digit of floor(x/p) is at least (p+1)/2, which is the same
-// criterion the sieve's chunk-wide Kummer skips test for #396-shaped runs,
-// and multi-carry digit sums are dominated the same way; hence every accounting
-// rule below (log accumulator, presieve patterns, skips, thresholds, prime
-// bounds) is a valid relaxation of the #389 condition. Survivors go to the
-// exact oracle exact_check389, so reported minima are exact.
+// Soundness of the sieve (Kummer digit analysis; full write-up in
+// NOTES-389.md): for a prime p | N-i the digit-0 addition of (N-m) + N in
+// base p carries freely iff 2i >= m, so only run positions i <= K = (m-1)/2
+// need fully accounted smoothness - those are the positions this sieve
+// scans. For them, a carry at digit >= 1 is possible iff some base-p digit
+// of floor(x/p) is at least (p+1)/2, which is the same criterion the sieve's
+// chunk-wide Kummer skips test for #396-shaped runs, and multi-carry digit
+// sums are dominated the same way; hence every accounting rule below (log
+// accumulator, presieve patterns, skips, thresholds, prime bounds) is a
+// valid relaxation of the #389 condition. Survivors go to the exact oracle
+// exact_check389, so reported minima are exact.
 //
 // Pairing: n = 2K+2 and n = 2K+3 share the same K, so one scan serves both
 // (two minima, two oracle calls per survivor, stop when both are found).
@@ -986,16 +987,24 @@ int main(int argc, char **argv)
         uint64_t n_prob = std::strtoull(argv[1], nullptr, 10);
         uint64_t s = std::strtoull(argv[2], nullptr, 10);
         g_end_L = std::strtoull(argv[3], nullptr, 10);
+        bool pair = std::getenv("PAIR") && std::atoi(std::getenv("PAIR")) != 0;
         uint64_t m = n_prob - 1;
         uint64_t K = m >= 1 ? (m - 1) / 2 : 0;
         g_m1 = m;
-        g_m2 = 0;
+        g_m2 = pair ? n_prob : 0; // with PAIR=1, n is the even pair member; n+1 has m = n
         g_min1.store(UINT64_MAX);
         g_min2.store(UINT64_MAX);
         detect_threads();
         get_primes(1'000'000);
         uint64_t ans = solve(K, s);
-        std::cout << "RESULT " << n_prob << " " << (ans == UINT64_MAX ? 0 : ans) << std::endl;
+        if (pair)
+        {
+            uint64_t a2 = g_min2.load();
+            std::cout << "RESULT " << n_prob << " " << (ans == UINT64_MAX ? 0 : ans) << " "
+                      << (a2 == UINT64_MAX ? 0 : a2) << std::endl;
+        }
+        else
+            std::cout << "RESULT " << n_prob << " " << (ans == UINT64_MAX ? 0 : ans) << std::endl;
         return 0;
     }
 
